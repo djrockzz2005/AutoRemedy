@@ -1,0 +1,5 @@
+-r common.txt
+grpcio==1.74.0
+grpcio-tools==1.74.0
+protobuf==6.31.1
+
