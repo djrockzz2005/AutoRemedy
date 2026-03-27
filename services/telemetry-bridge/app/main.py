@@ -16,6 +16,7 @@ logger = install_observability(app, "telemetry-bridge")
 PROM_URL = os.getenv("PROMETHEUS_URL", "http://prometheus:9090")
 LOKI_URL = os.getenv("LOKI_URL", "http://loki:3100")
 WINDOW = int(os.getenv("FEATURE_WINDOW", "120"))
+COLLECT_INTERVAL = float(os.getenv("COLLECT_INTERVAL_SECONDS", "2"))
 history: deque[dict] = deque(maxlen=WINDOW)
 
 QUERIES = {
@@ -71,7 +72,7 @@ async def collect_features() -> None:
             sample.setdefault("loki_errors", 0.0)
             sample.setdefault("availability", 1.0)
         history.append(sample)
-        await asyncio.sleep(15)
+        await asyncio.sleep(COLLECT_INTERVAL)
 
 
 @app.on_event("startup")
@@ -87,4 +88,3 @@ async def latest() -> dict:
 @app.get("/features/history")
 async def all_features() -> dict:
     return {"items": list(history)}
-

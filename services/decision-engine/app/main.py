@@ -13,6 +13,7 @@ logger = install_observability(app, "decision-engine")
 
 DETECTOR_URL = os.getenv("DETECTOR_URL", "http://anomaly-detector:8000")
 RECOVERY_URL = os.getenv("RECOVERY_URL", "http://recovery-engine:8000")
+DECISION_INTERVAL = float(os.getenv("DECISION_INTERVAL_SECONDS", "2"))
 processed: set[str] = set()
 decisions: list[dict] = []
 
@@ -53,7 +54,7 @@ async def control_loop() -> None:
                 items = response.json()["items"]
         except Exception as exc:
             logger.warning("Decision fetch failed", extra={"error": str(exc)})
-            await asyncio.sleep(10)
+            await asyncio.sleep(DECISION_INTERVAL)
             continue
 
         async with httpx.AsyncClient(timeout=8.0) as client:
@@ -73,7 +74,7 @@ async def control_loop() -> None:
                 del decisions[:-100]
                 processed.add(event["ts"])
                 logger.info("Decision executed", extra={"event": event["classification"], "actions": planned})
-        await asyncio.sleep(10)
+        await asyncio.sleep(DECISION_INTERVAL)
 
 
 @app.on_event("startup")

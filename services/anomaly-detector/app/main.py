@@ -18,6 +18,7 @@ logger = install_observability(app, "anomaly-detector")
 TELEMETRY_URL = os.getenv("TELEMETRY_URL", "http://telemetry-bridge:8000")
 WINDOW = int(os.getenv("MODEL_WINDOW", "80"))
 THRESHOLD = float(os.getenv("ANOMALY_THRESHOLD", "0.58"))
+DETECT_INTERVAL = float(os.getenv("DETECT_INTERVAL_SECONDS", "2"))
 
 feature_window: deque[dict] = deque(maxlen=WINDOW)
 scores: deque[dict] = deque(maxlen=200)
@@ -62,11 +63,11 @@ async def detect_loop() -> None:
                 sample = response.json()
         except Exception as exc:
             logger.warning("Detector fetch failed", extra={"error": str(exc)})
-            await asyncio.sleep(10)
+            await asyncio.sleep(DETECT_INTERVAL)
             continue
 
         if not sample or sample.get("ts") == last_event_ts:
-            await asyncio.sleep(10)
+            await asyncio.sleep(DETECT_INTERVAL)
             continue
 
         feature_window.append(sample)
@@ -93,7 +94,7 @@ async def detect_loop() -> None:
             events.append(event)
             logger.warning("Anomaly detected", extra=event)
         last_event_ts = sample["ts"]
-        await asyncio.sleep(10)
+        await asyncio.sleep(DETECT_INTERVAL)
 
 
 @app.on_event("startup")
@@ -114,4 +115,3 @@ async def score_history() -> dict:
 @app.get("/events")
 async def event_history() -> dict:
     return {"items": list(events)}
-
