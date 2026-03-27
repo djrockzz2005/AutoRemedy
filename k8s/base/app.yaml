@@ -1,0 +1,286 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user-service
+  namespace: chaos-loop
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: user-service
+  template:
+    metadata:
+      labels:
+        app: user-service
+    spec:
+      containers:
+        - name: user-service
+          image: chaos/user-service:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SERVICE_NAME
+              value: user-service
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: user-service
+  namespace: chaos-loop
+spec:
+  selector:
+    app: user-service
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service
+  namespace: chaos-loop
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: payment-service
+  template:
+    metadata:
+      labels:
+        app: payment-service
+    spec:
+      containers:
+        - name: payment-service
+          image: chaos/payment-service:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SERVICE_NAME
+              value: payment-service
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-service
+  namespace: chaos-loop
+spec:
+  selector:
+    app: payment-service
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inventory-service
+  namespace: chaos-loop
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: inventory-service
+  template:
+    metadata:
+      labels:
+        app: inventory-service
+    spec:
+      containers:
+        - name: inventory-service
+          image: chaos/inventory-service:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SERVICE_NAME
+              value: inventory-service
+            - name: GRPC_PORT
+              value: "50051"
+          ports:
+            - containerPort: 8000
+            - containerPort: 50051
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: inventory-service
+  namespace: chaos-loop
+spec:
+  selector:
+    app: inventory-service
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+  namespace: chaos-loop
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: order-service
+  template:
+    metadata:
+      labels:
+        app: order-service
+    spec:
+      containers:
+        - name: order-service
+          image: chaos/order-service:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SERVICE_NAME
+              value: order-service
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-service
+  namespace: chaos-loop
+spec:
+  selector:
+    app: order-service
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: order-service
+  namespace: chaos-loop
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: order-service
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 65
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: recommendation-service
+  namespace: chaos-loop
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: recommendation-service
+      lane: primary
+  template:
+    metadata:
+      labels:
+        app: recommendation-service
+        lane: primary
+    spec:
+      containers:
+        - name: recommendation-service
+          image: chaos/recommendation-service:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SERVICE_NAME
+              value: recommendation-service
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: recommendation-service-shadow
+  namespace: chaos-loop
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: recommendation-service
+      lane: shadow
+  template:
+    metadata:
+      labels:
+        app: recommendation-service
+        lane: shadow
+    spec:
+      containers:
+        - name: recommendation-service-shadow
+          image: chaos/recommendation-service:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SERVICE_NAME
+              value: recommendation-service-shadow
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: recommendation-service
+  namespace: chaos-loop
+spec:
+  selector:
+    app: recommendation-service
+    lane: primary
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: recommendation-service-shadow
+  namespace: chaos-loop
+spec:
+  selector:
+    app: recommendation-service
+    lane: shadow
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+  namespace: chaos-loop
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: api-gateway
+  template:
+    metadata:
+      labels:
+        app: api-gateway
+    spec:
+      containers:
+        - name: api-gateway
+          image: chaos/api-gateway:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SERVICE_NAME
+              value: api-gateway
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-gateway
+  namespace: chaos-loop
+spec:
+  selector:
+    app: api-gateway
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+

@@ -1,0 +1,353 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: platform-controller
+  namespace: chaos-loop
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: platform-controller
+  namespace: chaos-loop
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services"]
+    verbs: ["get", "list", "watch", "delete", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "deployments/scale"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: platform-controller
+  namespace: chaos-loop
+subjects:
+  - kind: ServiceAccount
+    name: platform-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: platform-controller
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+  namespace: chaos-loop
+data:
+  init.sql: |
+    CREATE DATABASE users;
+    CREATE DATABASE orders;
+    CREATE DATABASE payments;
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: chaos-loop
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17.4
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: platform
+            - name: POSTGRES_PASSWORD
+              value: platform
+            - name: POSTGRES_DB
+              value: postgres
+          volumeMounts:
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d/init.sql
+              subPath: init.sql
+      volumes:
+        - name: init
+          configMap:
+            name: postgres-init
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: chaos-loop
+spec:
+  selector:
+    app: postgres
+  ports:
+    - name: db
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: chaos-loop
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:8.0.3
+          ports:
+            - containerPort: 6379
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: chaos-loop
+spec:
+  selector:
+    app: redis
+  ports:
+    - name: cache
+      port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: telemetry-bridge
+  namespace: chaos-loop
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: telemetry-bridge
+  template:
+    metadata:
+      labels:
+        app: telemetry-bridge
+    spec:
+      serviceAccountName: platform-controller
+      containers:
+        - name: telemetry-bridge
+          image: chaos/telemetry-bridge:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SERVICE_NAME
+              value: telemetry-bridge
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: telemetry-bridge
+  namespace: chaos-loop
+spec:
+  selector:
+    app: telemetry-bridge
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: anomaly-detector
+  namespace: chaos-loop
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: anomaly-detector
+  template:
+    metadata:
+      labels:
+        app: anomaly-detector
+    spec:
+      containers:
+        - name: anomaly-detector
+          image: chaos/anomaly-detector:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SERVICE_NAME
+              value: anomaly-detector
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: anomaly-detector
+  namespace: chaos-loop
+spec:
+  selector:
+    app: anomaly-detector
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: recovery-engine
+  namespace: chaos-loop
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: recovery-engine
+  template:
+    metadata:
+      labels:
+        app: recovery-engine
+    spec:
+      serviceAccountName: platform-controller
+      containers:
+        - name: recovery-engine
+          image: chaos/recovery-engine:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SERVICE_NAME
+              value: recovery-engine
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: recovery-engine
+  namespace: chaos-loop
+spec:
+  selector:
+    app: recovery-engine
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: decision-engine
+  namespace: chaos-loop
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: decision-engine
+  template:
+    metadata:
+      labels:
+        app: decision-engine
+    spec:
+      containers:
+        - name: decision-engine
+          image: chaos/decision-engine:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SERVICE_NAME
+              value: decision-engine
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: decision-engine
+  namespace: chaos-loop
+spec:
+  selector:
+    app: decision-engine
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chaos-engine
+  namespace: chaos-loop
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: chaos-engine
+  template:
+    metadata:
+      labels:
+        app: chaos-engine
+    spec:
+      serviceAccountName: platform-controller
+      containers:
+        - name: chaos-engine
+          image: chaos/chaos-engine:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SERVICE_NAME
+              value: chaos-engine
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chaos-engine
+  namespace: chaos-loop
+spec:
+  selector:
+    app: chaos-engine
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dashboard
+  namespace: chaos-loop
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dashboard
+  template:
+    metadata:
+      labels:
+        app: dashboard
+    spec:
+      containers:
+        - name: dashboard
+          image: chaos/dashboard:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SERVICE_NAME
+              value: dashboard
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dashboard
+  namespace: chaos-loop
+spec:
+  type: NodePort
+  selector:
+    app: dashboard
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      nodePort: 30080
+
