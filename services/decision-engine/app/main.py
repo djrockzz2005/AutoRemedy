@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import hashlib
 import os
 import random
@@ -40,6 +41,35 @@ retry_counts: dict[tuple[str, str], int] = {}
 failure_streaks: dict[tuple[str, str], int] = {}
 circuit_open_until: dict[tuple[str, str], float] = {}
 playbooks: dict[str, list[dict[str, Any]]] = {}
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def parse_timestamp(value: Any) -> datetime | None:
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def seconds_between(start: Any, end: Any) -> float | None:
+    start_dt = parse_timestamp(start)
+    end_dt = parse_timestamp(end)
+    if start_dt is None or end_dt is None:
+        return None
+    return max((end_dt - start_dt).total_seconds(), 0.0)
+
+
+def latest_result_timestamp(results: list[dict[str, Any]]) -> str | None:
+    timestamps = [parse_timestamp(item.get("ts")) for item in results if isinstance(item, dict)]
+    valid = [item for item in timestamps if item is not None]
+    if not valid:
+        return None
+    return max(valid).isoformat()
 
 
 def top_service(
@@ -430,7 +460,16 @@ async def control_loop() -> None:
                     await record_suppression(event, planned, "retry_limit", target, severity="critical")
                     processed.add(event["ts"])
                     continue
-                decision_record = {"event": event, "actions": planned, "results": []}
+                decision_record = {
+                    "event": event,
+                    "actions": planned,
+                    "results": [],
+                    "detected_at": event.get("ts"),
+                    "action_started_at": utc_now_iso(),
+                    "action_completed_at": None,
+                    "recovered_at": None,
+                    "mttr_seconds": None,
+                }
                 for action in planned:
                     payload = {**action, "reason": event["classification"]}
                     try:
@@ -439,13 +478,23 @@ async def control_loop() -> None:
                         decision_record["results"].append(action_response.json())
                     except Exception as exc:
                         decision_record["results"].append({"status": "failed", "error": str(exc), **payload})
+                decision_record["action_completed_at"] = utc_now_iso()
                 decisions.append(decision_record)
                 del decisions[:-100]
-                record_history("decision-log", "decision-engine", decision_record)
                 succeeded = all(item.get("status") != "failed" for item in decision_record["results"])
+                recovered_at = latest_result_timestamp(decision_record["results"]) or decision_record["action_completed_at"]
+                if succeeded:
+                    decision_record["recovered_at"] = recovered_at
+                    mttr_seconds = seconds_between(decision_record.get("detected_at"), recovered_at)
+                    if mttr_seconds is not None:
+                        decision_record["mttr_seconds"] = round(mttr_seconds, 3)
                 mark_outcome(event["classification"], target, succeeded)
                 if succeeded:
-                    last_recovery_at[(event["classification"], target)] = time.time()
+                    recovered_dt = parse_timestamp(recovered_at)
+                    last_recovery_at[(event["classification"], target)] = (
+                        recovered_dt.timestamp() if recovered_dt is not None else time.time()
+                    )
+                record_history("decision-log", "decision-engine", decision_record)
                 processed.add(event["ts"])
                 audit_event(
                     "decision-engine",
@@ -487,13 +536,16 @@ async def feedback() -> dict:
     successful = 0
     failed = 0
     suppressed = 0
-    latencies = []
+    mttrs = []
     by_classification: dict[str, dict[str, Any]] = {}
     action_preferences: dict[str, list[dict[str, Any]]] = {}
     for item in items:
         event = item.get("event", {})
         classification = event.get("classification", "unknown")
-        bucket = by_classification.setdefault(classification, {"total": 0, "successful": 0, "failed": 0, "suppressed": 0})
+        bucket = by_classification.setdefault(
+            classification,
+            {"total": 0, "successful": 0, "failed": 0, "suppressed": 0, "avg_mttr_seconds": 0.0},
+        )
         bucket["total"] += 1
         if item.get("suppressed"):
             suppressed += 1
@@ -504,15 +556,19 @@ async def feedback() -> dict:
         if succeeded:
             successful += 1
             bucket["successful"] += 1
-            try:
-                executed_at = last_recovery_at.get((classification, next((action.get("target") or action.get("service_name") for action in item.get("actions", []) if action.get("target") or action.get("service_name")), "unknown")))
-                if executed_at and event.get("ts"):
-                    latencies.append(max(0.0, executed_at - time.mktime(time.strptime(event["ts"][:19], "%Y-%m-%dT%H:%M:%S"))))
-            except Exception:
-                pass
+            mttr = item.get("mttr_seconds")
+            if not isinstance(mttr, (int, float)):
+                mttr = seconds_between(item.get("detected_at") or event.get("ts"), item.get("recovered_at"))
+            if isinstance(mttr, (int, float)):
+                bucket.setdefault("_mttr_samples", []).append(float(mttr))
+                mttrs.append(float(mttr))
         else:
             failed += 1
             bucket["failed"] += 1
+    for bucket in by_classification.values():
+        mttr_samples = bucket.pop("_mttr_samples", [])
+        bucket["success_rate"] = round(bucket["successful"] / max(bucket["total"] - bucket["suppressed"], 1), 4)
+        bucket["avg_mttr_seconds"] = round(sum(mttr_samples) / len(mttr_samples), 3) if mttr_samples else 0.0
     stats = action_feedback_stats()
     grouped_action_preferences: dict[str, list[dict[str, Any]]] = {}
     for signature, bucket in stats.items():
@@ -542,7 +598,8 @@ async def feedback() -> dict:
         "failed": failed,
         "suppressed": suppressed,
         "success_rate": round(successful / max(total - suppressed, 1), 4),
-        "avg_detection_to_action_seconds": round(sum(latencies) / len(latencies), 3) if latencies else 0.0,
+        "avg_mttr_seconds": round(sum(mttrs) / len(mttrs), 3) if mttrs else 0.0,
+        "avg_detection_to_action_seconds": round(sum(mttrs) / len(mttrs), 3) if mttrs else 0.0,
         "by_classification": by_classification,
         "action_preferences": action_preferences,
     }

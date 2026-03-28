@@ -120,6 +120,8 @@ def request_json(url: str, method: str = "GET", payload: dict | None = None, ret
 
 
 def resolve_run_list(selected: str) -> list[tuple[str, dict]]:
+    if selected in {"wow", "default", "live"}:
+        selected = "ddos-simulation"
     if selected == "all":
         return [(name, SCENARIOS[name]) for name in SECURITY_ORDER + INFRA_ORDER]
     if selected == "attacks":

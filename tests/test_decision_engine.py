@@ -222,7 +222,7 @@ class DecisionEngineTests(unittest.IsolatedAsyncioTestCase):
 
         clients = [
             FakeAsyncClient(event_payload={"items": [event]}),
-            FakeAsyncClient(action_result={"status": "completed"}),
+            FakeAsyncClient(action_result={"status": "completed", "ts": "2026-03-28T12:00:08+00:00"}),
         ]
 
         async def stop_after_iteration(_seconds: float) -> None:
@@ -238,6 +238,9 @@ class DecisionEngineTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(MODULE.decisions), 1)
         self.assertEqual(MODULE.decisions[0]["actions"][0]["target"], "payment-service")
+        self.assertEqual(MODULE.decisions[0]["detected_at"], "2026-03-28T12:00:00+00:00")
+        self.assertEqual(MODULE.decisions[0]["recovered_at"], "2026-03-28T12:00:08+00:00")
+        self.assertEqual(MODULE.decisions[0]["mttr_seconds"], 8.0)
         self.assertEqual(FakeAsyncClient.posted_payloads[0][0], f"{MODULE.RECOVERY_URL}/recover")
         self.assertEqual(FakeAsyncClient.posted_payloads[0][1]["reason"], "pod_instability")
 
@@ -246,6 +249,9 @@ class DecisionEngineTests(unittest.IsolatedAsyncioTestCase):
             [
                 {
                     "event": {"classification": "ddos_attack"},
+                    "detected_at": "2026-03-28T12:00:00+00:00",
+                    "recovered_at": "2026-03-28T12:00:06+00:00",
+                    "mttr_seconds": 6.0,
                     "actions": [{"action": "apply_rate_limit", "target": "api-gateway"}],
                     "results": [{"status": "completed"}],
                 },
@@ -262,6 +268,8 @@ class DecisionEngineTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("ddos_attack", payload["action_preferences"])
         self.assertEqual(payload["action_preferences"]["ddos_attack"][0]["action"], "apply_rate_limit")
+        self.assertEqual(payload["avg_mttr_seconds"], 6.0)
+        self.assertEqual(payload["by_classification"]["ddos_attack"]["avg_mttr_seconds"], 6.0)
 
 
 if __name__ == "__main__":

@@ -36,7 +36,7 @@ def synthetic_target(request: ScenarioRequest, fallback: str) -> str:
     return request.target or fallback
 
 
-def inject_ddos_telemetry(target: str, total_requests: int = 220, attacker_requests: int = 60, unique_ips: int = 80) -> dict[str, Any]:
+def inject_ddos_telemetry(target: str, total_requests: int = 320, attacker_requests: int = 90, unique_ips: int = 120) -> dict[str, Any]:
     generated_unique_ips = max(unique_ips, 1)
     attacker_ip = "198.51.100.10"
     for _ in range(max(attacker_requests, 1)):
@@ -57,7 +57,7 @@ def inject_ddos_telemetry(target: str, total_requests: int = 220, attacker_reque
     }
 
 
-def inject_xss_telemetry(target: str, attempts: int = 5) -> dict[str, Any]:
+def inject_xss_telemetry(target: str, attempts: int = 8) -> dict[str, Any]:
     for index in range(max(attempts, 1)):
         increment_security_metric(target, "xss_attempt_count")
         if index % 2 == 0:

@@ -39,6 +39,7 @@ class DashboardSnapshotTests(unittest.TestCase):
             f"{module.DETECTOR_URL}/scores": FakeResponse({"items": [{"ts": "2026-03-28T10:00:00", "score": 0.42, "sample": {}}]}),
             f"{module.DETECTOR_URL}/events": FakeResponse({}, error="detector unavailable"),
             f"{module.DECISION_URL}/decisions": FakeResponse({"items": [{"event": {"classification": "latency_spike"}, "actions": []}]}),
+            f"{module.DECISION_URL}/feedback": FakeResponse({"success_rate": 0.94, "avg_mttr_seconds": 9.5, "by_classification": {"latency_spike": {"avg_mttr_seconds": 9.5, "success_rate": 0.94, "total": 3}}}),
             f"{module.RECOVERY_URL}/timeline": FakeResponse({}, error="recovery unavailable"),
             f"{module.TELEMETRY_URL}/slo/status": FakeResponse({"overall_compliance": 98, "items": [{"service": "api", "healthy": True}]}),
             f"{module.CHAOS_URL}/experiments": FakeResponse({}, error="chaos unavailable"),
@@ -55,6 +56,8 @@ class DashboardSnapshotTests(unittest.TestCase):
         self.assertEqual(len(payload["scores"]), 1)
         self.assertEqual(payload["events"], [])
         self.assertEqual(len(payload["decisions"]), 1)
+        self.assertEqual(payload["feedback"]["avg_mttr_seconds"], 9.5)
+        self.assertEqual(payload["feedback"]["success_rate"], 0.94)
         self.assertEqual(payload["timeline"], [])
         self.assertEqual(payload["slos"]["overall_compliance"], 98)
         self.assertEqual(payload["experiments"], [])

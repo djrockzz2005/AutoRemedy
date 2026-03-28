@@ -13,6 +13,11 @@ MODULE = load_module("services/anomaly-detector/app/main.py", "anomaly_detector_
 class StubClassifier:
     def __init__(self, label: str) -> None:
         self.label = label
+        self.feature_importances_ = [0.0] * len(MODULE.FEATURE_KEYS)
+        if self.feature_importances_:
+            self.feature_importances_[0] = 0.7
+            if len(self.feature_importances_) > 2:
+                self.feature_importances_[2] = 0.3
 
     def predict(self, matrix):
         return [self.label]
@@ -109,6 +114,16 @@ class AnomalyDetectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(MODULE.rule_based_classify({"session_hijack_attempt_count": 1}), "session_hijacking_attack")
         self.assertEqual(MODULE.rule_based_classify({"credential_stuffing_attempt_count": 3}), "credential_stuffing_attack")
         self.assertEqual(MODULE.rule_based_classify({"sqli_attempt_count": 1}), "sqli_attack")
+
+    async def test_model_metrics_exposes_feature_importances(self) -> None:
+        MODULE.classifier_model = StubClassifier("learned_label")
+        MODULE.labeled_samples.extend({"vector": [], "label": "x"} for _ in range(MODULE.CLASSIFIER_MIN_SAMPLES))
+
+        payload = await MODULE.model_metrics()
+
+        self.assertTrue(payload["classifier_ready"])
+        self.assertEqual(payload["top_features"][0]["feature"], MODULE.FEATURE_KEYS[0])
+        self.assertGreater(payload["top_features"][0]["importance"], 0.0)
 
     async def test_detect_loop_records_event_from_mocked_telemetry(self) -> None:
         sample = {

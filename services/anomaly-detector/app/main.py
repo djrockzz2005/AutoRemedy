@@ -90,6 +90,62 @@ def build_vector(sample: dict) -> list[float]:
     return [float(sample.get(key, 0.0)) for key in FEATURE_KEYS]
 
 
+def heuristic_anomaly_score(sample: dict) -> float:
+    request_rate = float(sample.get("request_rate", 0.0))
+    error_rate = float(sample.get("error_rate", 0.0))
+    latency = float(sample.get("latency_p95", 0.0))
+    restarts = float(sample.get("restarts", 0.0))
+    loki_errors = float(sample.get("loki_errors", 0.0))
+    ddos_score = max(
+        float(sample.get("requests_per_ip_per_second", 0.0)) / max(float(os.getenv("DDOS_ATTACK_IP_RATE_THRESHOLD", "25")), 1.0),
+        float(sample.get("connection_count", 0.0)) / max(float(os.getenv("DDOS_CONNECTION_COUNT_THRESHOLD", "150")), 1.0),
+        float(sample.get("syn_flood_score", 0.0)) / max(float(os.getenv("DDOS_SYN_FLOOD_SCORE_THRESHOLD", "0.4")), 0.0001),
+        (
+            (float(sample.get("unique_source_ips", 0.0)) / max(float(sample.get("connection_count", 0.0)), 1.0))
+            / max(float(os.getenv("DDOS_UNIQUE_IP_RATIO_THRESHOLD", "0.65")), 0.0001)
+        ),
+    )
+    mitm_score = max(
+        float(sample.get("tls_handshake_failures", 0.0)),
+        float(sample.get("certificate_mismatch_count", 0.0)),
+        float(sample.get("unexpected_certificate_fingerprints", 0.0)),
+        float(sample.get("tls_downgrade_attempt_count", 0.0)),
+        float(sample.get("dns_spoof_attempt_count", 0.0)),
+        float(sample.get("arp_spoof_attempt_count", 0.0)),
+        float(sample.get("rogue_wifi_attempt_count", 0.0)),
+        float(sample.get("aitm_phishing_attempt_count", 0.0)),
+    )
+    xss_score = float(sample.get("xss_attempt_count", 0.0)) / max(float(os.getenv("XSS_ATTACK_THRESHOLD", "1")), 1.0)
+    clickjack_score = float(sample.get("clickjack_attempt_count", 0.0)) / max(float(os.getenv("CLICKJACK_ATTACK_THRESHOLD", "1")), 1.0)
+    csrf_score = float(sample.get("csrf_attempt_count", 0.0)) / max(float(os.getenv("CSRF_ATTACK_THRESHOLD", "1")), 1.0)
+    session_score = float(sample.get("session_hijack_attempt_count", 0.0))
+    credential_score = float(sample.get("credential_stuffing_attempt_count", 0.0))
+    sqli_score = float(sample.get("sqli_attempt_count", 0.0))
+    supply_chain_score = float(sample.get("supply_chain_risk_count", 0.0))
+    zero_day_score = float(sample.get("zero_day_signal_count", 0.0))
+    security_score = max(
+        ddos_score,
+        mitm_score,
+        xss_score,
+        clickjack_score,
+        csrf_score,
+        session_score,
+        credential_score,
+        sqli_score,
+        supply_chain_score,
+        zero_day_score,
+    )
+    reliability_score = max(
+        error_rate / 0.5,
+        latency / 1.2,
+        restarts,
+        loki_errors / 5.0,
+        (1.0 - float(sample.get("availability", 1.0))) / 0.1,
+    )
+    traffic_score = request_rate / max(MIN_ACTIVE_REQUEST_RATE, 0.0001)
+    return round(min(1.0, max(security_score, reliability_score, traffic_score * 0.15)), 4)
+
+
 def rule_based_classify(sample: dict) -> str:
     request_rate = float(sample.get("request_rate", 0.0))
     single_ip_rate = float(sample.get("requests_per_ip_per_second", 0.0))
@@ -213,6 +269,21 @@ def classify(sample: dict) -> str:
     return rule_based_classify(sample)
 
 
+def classifier_feature_importances() -> list[dict[str, float | str]]:
+    if classifier_model is None or not hasattr(classifier_model, "feature_importances_"):
+        return []
+    try:
+        pairs = [
+            {"feature": FEATURE_KEYS[index], "importance": round(float(value), 6)}
+            for index, value in enumerate(classifier_model.feature_importances_)
+        ]
+    except Exception:
+        return []
+    ranked = [item for item in pairs if item["importance"] > 0.0]
+    ranked.sort(key=lambda item: float(item["importance"]), reverse=True)
+    return ranked
+
+
 def annotate_per_service(sample: dict) -> dict[str, Any]:
     per_service = sample.get("per_service", {}) or {}
     if not isinstance(per_service, dict):
@@ -332,13 +403,14 @@ async def detect_loop() -> None:
             service_feature_window.append(item)
         if should_retrain(len(service_feature_window), last_service_model_train_size, 20):
             train_service_isolation_model()
+        heuristic_score = heuristic_anomaly_score(sample)
         if low_signal_sample(sample):
             anomaly_score = 0.0
         elif isolation_model is not None and len(feature_window) >= 20:
             decision = isolation_model.decision_function(np.array([vector]))[0]
-            anomaly_score = 1 / (1 + math.exp(decision * 3))
+            anomaly_score = max(float(1 / (1 + math.exp(decision * 3))), heuristic_score)
         else:
-            anomaly_score = min(1.0, sample.get("error_rate", 0) + sample.get("latency_p95", 0))
+            anomaly_score = heuristic_score
         ranked_services = []
         for item in per_service_vectors:
             service_score = round(score_service_vector(item), 4)
@@ -423,6 +495,7 @@ async def status() -> dict:
 async def model_metrics() -> dict:
     recent = list(scores)[-20:]
     anomaly_rate = round(sum(1 for item in recent if item.get("score", 0.0) >= THRESHOLD) / len(recent), 4) if recent else 0.0
+    feature_importances = classifier_feature_importances()
     return {
         "window": len(feature_window),
         "labeled_samples": len(labeled_samples),
@@ -432,6 +505,9 @@ async def model_metrics() -> dict:
         "anomaly_rate_recent": anomaly_rate,
         "drift_score": current_drift_score(),
         "baseline_ready": bool(baseline_mean),
+        "classifier_ready": classifier_model is not None,
+        "feature_importances": feature_importances,
+        "top_features": feature_importances[:5],
     }
 
 

@@ -202,7 +202,7 @@ HTML = r"""
       html, body { overflow-x:hidden; }
       .hero, .top-grid, .main-grid, .bottom-grid { display:grid; gap:18px; }
       .hero { grid-template-columns: 1.2fr .8fr; margin-bottom:18px; }
-      .top-grid { grid-template-columns: repeat(4, 1fr); margin-bottom:18px; }
+      .top-grid { grid-template-columns: repeat(5, 1fr); margin-bottom:18px; }
       .main-grid { grid-template-columns: minmax(0, 1.2fr) minmax(0, .8fr); margin-bottom:18px; }
       .bottom-grid { grid-template-columns: 1fr 1fr; }
       .stack { display:grid; gap:18px; }
@@ -427,6 +427,8 @@ HTML = r"""
         <div class="card metric-card"><div class="metric-label">Recovery action</div><div id="recovery" class="kpi">none</div><div class="micro" id="recoveryMeta">Autonomous remediation idle</div></div>
         <div class="card metric-card"><div class="metric-label">Latency p95</div><div id="latency" class="kpi">0ms</div><div class="micro" id="latencyMeta">Live request path health</div></div>
         <div class="card metric-card"><div class="metric-label">SLO compliance</div><div id="sloCompliance" class="kpi">100%</div><div class="micro" id="sloMeta">Error budget healthy</div></div>
+        <div class="card metric-card"><div class="metric-label">Remediation success</div><div id="successRate" class="kpi">100%</div><div class="micro" id="successRateMeta">Recent closed-loop outcomes</div></div>
+        <div class="card metric-card"><div class="metric-label">Avg MTTR</div><div id="avgMttr" class="kpi">0.0s</div><div class="micro" id="avgMttrMeta">Mean time to recovery</div></div>
         <div class="card metric-card"><div class="metric-label">Security posture</div><div id="securityStatus" class="kpi">Nominal</div><div class="micro" id="securityMeta">No active attack telemetry</div></div>
         <div class="card metric-card"><div class="metric-label">Blocked attempts</div><div id="blockedAttempts" class="kpi">0</div><div class="micro" id="blockedMeta">Gateway and dashboard blocks</div></div>
         <div class="card metric-card"><div class="metric-label">Mitigations</div><div id="activeMitigations" class="kpi">0</div><div class="micro" id="mitigationMeta">Temporary controls inactive</div></div>
@@ -708,16 +710,25 @@ HTML = r"""
         document.getElementById('liveState').textContent = 'Streaming live from the cluster';
         const scores = data.scores || [];
         const sloStatus = data.slos || { overall_compliance: 100, items: [] };
+        const feedback = data.feedback || { by_classification: {}, avg_mttr_seconds: 0 };
         draw(scores.map(item => item.score));
         const latest = scores[scores.length - 1];
         const latestSample = latest && latest.sample ? latest.sample : {};
         const latestEvent = preferredEvent(data.events);
         const latestRecovery = preferredRecovery(data.timeline);
+        const successRate = Number(feedback.success_rate || 0);
+        const avgMttr = Number(feedback.avg_mttr_seconds || 0);
+        const classifications = Object.entries(feedback.by_classification || {});
+        const strongestClassification = classifications
+          .filter(([, item]) => Number(item.total || 0) > 0)
+          .sort((left, right) => Number(right[1].success_rate || 0) - Number(left[1].success_rate || 0))[0];
         document.getElementById('score').textContent = latest ? latest.score.toFixed(2) : '0.00';
         document.getElementById('classification').textContent = latestEvent ? classificationLabel(latestEvent.classification) : 'Steady';
         document.getElementById('recovery').textContent = latestRecovery ? humanize(latestRecovery.action) : 'None';
         document.getElementById('latency').textContent = `${Math.round((latestSample.latency_p95 || 0) * 1000)}ms`;
         document.getElementById('sloCompliance').textContent = `${Math.round(sloStatus.overall_compliance || 100)}%`;
+        document.getElementById('successRate').textContent = `${Math.round(successRate * 100)}%`;
+        document.getElementById('avgMttr').textContent = `${avgMttr.toFixed(1)}s`;
         document.getElementById('scoreMeta').textContent = latest ? `Updated ${latest.ts.slice(11,19)}` : 'IsolationForest signal';
         document.getElementById('classificationMeta').textContent = latestEvent
           ? `${latestEvent.classification === 'unknown_anomaly' ? 'Attribution pending' : `Score ${latestEvent.score.toFixed(2)}`}`
@@ -727,6 +738,10 @@ HTML = r"""
           : 'Autonomous remediation idle';
         document.getElementById('latencyMeta').textContent = `Availability ${(latestSample.availability || 1).toFixed(2)}`;
         document.getElementById('sloMeta').textContent = (sloStatus.items || []).some(item => !item.healthy) ? 'SLO violations active' : 'Error budget healthy';
+        document.getElementById('successRateMeta').textContent = strongestClassification
+          ? `${classificationLabel(strongestClassification[0])} leading at ${Math.round(Number(strongestClassification[1].success_rate || 0) * 100)}%`
+          : 'Recent closed-loop outcomes';
+        document.getElementById('avgMttrMeta').textContent = avgMttr > 0 ? 'Detection to recovery across recent successes' : 'Mean time to recovery';
         const activeSecurityEvent = (data.events || []).slice().reverse().find(item => ['ddos_attack', 'mitm_attack', 'xss_attack', 'clickjacking_attack', 'csrf_attack', 'session_hijacking_attack', 'credential_stuffing_attack', 'sqli_attack', 'supply_chain_attack', 'zero_day_attack'].includes(item.classification));
         const blockedAttempts = Math.round(latestSample.blocked_attempt_count || 0);
         const activeMitigations = Math.round(latestSample.active_mitigations || 0);
@@ -742,11 +757,15 @@ HTML = r"""
         document.getElementById('windowSize').textContent = String(scores.length);
         document.getElementById('signalState').textContent = latest && latest.score >= 0.58 ? 'Active incident' : 'Nominal';
         const timelineRows = (data.timeline || []).slice(-8).reverse().map(i => `<tr><td>${i.ts.slice(11,19)}</td><td>${i.namespace || '-'}</td><td>${humanize(i.action)}</td><td>${humanize(i.status)}</td></tr>`).join('');
-        const decisionRows = (data.decisions || []).slice(-8).reverse().map(i => `<tr><td>${classificationLabel(i.event.classification)}</td><td>${i.actions.map(a => humanize(a.action)).join(', ')}</td></tr>`).join('');
+        const decisionRows = (data.decisions || []).slice(-8).reverse().map(i => {
+          const classification = i.event.classification;
+          const mttr = (feedback.by_classification && feedback.by_classification[classification] && feedback.by_classification[classification].avg_mttr_seconds) || i.mttr_seconds || 0;
+          return `<tr><td>${classificationLabel(classification)}</td><td>${i.actions.map(a => humanize(a.action)).join(', ')}</td><td>${mttr ? `${Number(mttr).toFixed(1)}s` : '-'}</td></tr>`;
+        }).join('');
         const sloRows = (sloStatus.items || []).map(i => `<tr><td>${i.service}</td><td>${i.compliance}%</td><td>${i.burn_rate}</td><td>${i.violations.join(', ') || 'ok'}</td></tr>`).join('');
         const experimentRows = (data.experiments || []).slice(-8).reverse().map(i => `<tr><td>${i.name}</td><td>${i.target || '-'}</td><td>${i.evaluation && i.evaluation.reason ? humanize(i.evaluation.reason) : humanize(i.status)}</td><td>${i.evaluation && i.evaluation.healed ? 'Healed' : humanize(i.status)}</td></tr>`).join('');
         document.getElementById('timeline').innerHTML = '<tr><th>Time</th><th>NS</th><th>Action</th><th>Status</th></tr>' + (timelineRows || '<tr><td colspan="4" class="empty">No recovery actions yet.</td></tr>');
-        document.getElementById('decisions').innerHTML = '<tr><th>Event</th><th>Actions</th></tr>' + (decisionRows || '<tr><td colspan="2" class="empty">No decisions yet.</td></tr>');
+        document.getElementById('decisions').innerHTML = '<tr><th>Event</th><th>Actions</th><th>MTTR</th></tr>' + (decisionRows || '<tr><td colspan="3" class="empty">No decisions yet.</td></tr>');
         document.getElementById('slos').innerHTML = '<tr><th>Service</th><th>Compliance</th><th>Burn</th><th>Status</th></tr>' + (sloRows || '<tr><td colspan="4" class="empty">No SLOs configured.</td></tr>');
         document.getElementById('experiments').innerHTML = '<tr><th>Name</th><th>Target</th><th>Result</th><th>Status</th></tr>' + (experimentRows || '<tr><td colspan="4" class="empty">No experiments yet.</td></tr>');
         const feed = [];
@@ -1172,6 +1191,7 @@ async def snapshot_payload() -> dict:
             snapshot_section(http_client, "scores", f"{DETECTOR_URL}/scores", lambda payload: payload.get("items", []), []),
             snapshot_section(http_client, "events", f"{DETECTOR_URL}/events", lambda payload: payload.get("items", []), []),
             snapshot_section(http_client, "decisions", f"{DECISION_URL}/decisions", lambda payload: payload.get("items", []), []),
+            snapshot_section(http_client, "feedback", f"{DECISION_URL}/feedback", lambda payload: payload, {"by_classification": {}, "avg_mttr_seconds": 0.0}),
             snapshot_section(http_client, "timeline", f"{RECOVERY_URL}/timeline", lambda payload: payload.get("items", []), []),
             snapshot_section(
                 http_client,
@@ -1193,9 +1213,10 @@ async def snapshot_payload() -> dict:
         "scores": snapshot_results[0][0],
         "events": snapshot_results[1][0],
         "decisions": snapshot_results[2][0],
-        "timeline": snapshot_results[3][0],
-        "slos": snapshot_results[4][0],
-        "experiments": snapshot_results[5][0],
+        "feedback": snapshot_results[3][0],
+        "timeline": snapshot_results[4][0],
+        "slos": snapshot_results[5][0],
+        "experiments": snapshot_results[6][0],
         "workloads": workloads,
         "unavailable": unavailable,
     }

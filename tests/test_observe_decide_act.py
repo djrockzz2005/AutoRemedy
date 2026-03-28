@@ -124,6 +124,69 @@ class ObserveDecideActTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(DecisionClient.posted[1]["action"], "restart_deployment")
         self.assertTrue(all(item["target"] == "payment-service" for item in DecisionClient.posted))
 
+    async def test_security_observe_decide_act(self) -> None:
+        sample = {
+            "ts": "2026-03-28T12:05:00+00:00",
+            "request_rate": 15.0,
+            "error_rate": 0.02,
+            "latency_p95": 0.1,
+            "restarts": 0.0,
+            "cpu": 0.2,
+            "memory": 0.2,
+            "loki_errors": 0.0,
+            "availability": 0.99,
+            "requests_per_ip_per_second": 35.0,
+            "unique_source_ips": 180.0,
+            "connection_count": 260.0,
+            "syn_flood_score": 0.6,
+            "blocked_attempt_count": 20.0,
+            "per_service": {
+                "api-gateway": {
+                    "request_rate": 15.0,
+                    "error_rate": 0.02,
+                    "latency_p95": 0.1,
+                    "availability": 0.99,
+                    "requests_per_ip_per_second": 35.0,
+                    "unique_source_ips": 180.0,
+                    "connection_count": 260.0,
+                    "syn_flood_score": 0.6,
+                    "blocked_attempt_count": 20.0,
+                }
+            },
+        }
+
+        async def stop_after_iteration(_seconds: float) -> None:
+            raise RuntimeError("stop-loop")
+
+        with patch.object(ANOMALY_MODULE, "THRESHOLD", 0.5), patch.object(
+            ANOMALY_MODULE,
+            "should_retrain",
+            return_value=False,
+        ), patch.object(
+            ANOMALY_MODULE.httpx,
+            "AsyncClient",
+            side_effect=lambda timeout=4.0: TelemetryClient(sample),
+        ), patch.object(ANOMALY_MODULE.asyncio, "sleep", side_effect=stop_after_iteration):
+            with self.assertRaisesRegex(RuntimeError, "stop-loop"):
+                await ANOMALY_MODULE.detect_loop()
+
+        decision_clients = [
+            DecisionClient(event_payload={"items": list(ANOMALY_MODULE.events)}),
+            DecisionClient(),
+        ]
+
+        with patch.object(
+            DECISION_MODULE.httpx,
+            "AsyncClient",
+            side_effect=lambda timeout=5.0: decision_clients.pop(0),
+        ), patch.object(DECISION_MODULE.asyncio, "sleep", side_effect=stop_after_iteration):
+            with self.assertRaisesRegex(RuntimeError, "stop-loop"):
+                await DECISION_MODULE.control_loop()
+
+        self.assertEqual(ANOMALY_MODULE.events[0]["classification"], "ddos_attack")
+        self.assertEqual(DecisionClient.posted[0]["action"], "apply_rate_limit")
+        self.assertEqual(DecisionClient.posted[1]["action"], "scale_under_ddos")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -11,6 +11,8 @@ This repository deploys a production-style microservice application on Kubernete
 5. `recovery-engine` executes recovery through the Kubernetes API.
 6. `dashboard` visualizes anomaly scores, decisions, and recovery timelines in real time.
 
+## Architecture
+
 ```mermaid
 flowchart LR
     J[Judge triggers drill] --> C[chaos-engine]
@@ -72,6 +74,10 @@ pip install -r requirements.txt
 
 The bootstrap script downloads `kind` and `kubectl` into `.bin/`. The deploy path expects Docker access and outbound network access to fetch base container images.
 `./scripts/demo.sh` now runs a 60-second live demo loop by default, and it also supports `./scripts/demo.sh all`, `./scripts/demo.sh attacks`, or `./scripts/demo.sh faults` to walk judges through multiple scenarios while they watch the dashboard at `http://localhost:8080`.
+
+## Live Demo
+
+Use `./scripts/demo.sh` or `./scripts/demo.sh wow` for the recommended judge flow. The script port-forwards the live services, injects a DDoS drill by default, polls anomaly detection and remediation every few seconds, and finishes with a JSON summary that includes time-to-detection, time-to-decision, time-to-recovery, and the learned action preferences from `GET /feedback`.
 
 ## Telemetry APIs
 

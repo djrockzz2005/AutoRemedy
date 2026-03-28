@@ -22,6 +22,16 @@ spec:
               value: user-service
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: http://tempo:4318/v1/traces
+          readinessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
 ---
 apiVersion: v1
 kind: Service
@@ -60,6 +70,16 @@ spec:
               value: payment-service
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: http://tempo:4318/v1/traces
+          readinessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
 ---
 apiVersion: v1
 kind: Service
@@ -103,6 +123,16 @@ spec:
           ports:
             - containerPort: 8000
             - containerPort: 50051
+          readinessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
 ---
 apiVersion: v1
 kind: Service
@@ -144,6 +174,16 @@ spec:
               value: order-service
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: http://tempo:4318/v1/traces
+          readinessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
 ---
 apiVersion: v1
 kind: Service
@@ -204,6 +244,16 @@ spec:
               value: recommendation-service
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: http://tempo:4318/v1/traces
+          readinessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -231,6 +281,16 @@ spec:
               value: recommendation-service-shadow
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: http://tempo:4318/v1/traces
+          readinessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
 ---
 apiVersion: v1
 kind: Service
@@ -284,6 +344,16 @@ spec:
               value: api-gateway
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: http://tempo:4318/v1/traces
+          readinessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
 ---
 apiVersion: v1
 kind: Service
