@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
+import random
 import time
 from pathlib import Path
 from typing import Any
@@ -26,6 +28,11 @@ MAX_RETRIES_PER_TARGET = int(os.getenv("MAX_RETRIES_PER_TARGET", "3"))
 CIRCUIT_BREAKER_THRESHOLD = int(os.getenv("CIRCUIT_BREAKER_THRESHOLD", "3"))
 CIRCUIT_BREAKER_SECONDS = float(os.getenv("CIRCUIT_BREAKER_SECONDS", "300"))
 PLAYBOOK_PATH = Path(os.getenv("PLAYBOOK_PATH", "/app/config/playbooks.yaml"))
+FEEDBACK_WINDOW = int(os.getenv("FEEDBACK_WINDOW", "200"))
+RL_EPSILON = float(os.getenv("RL_EPSILON", "0.15"))
+RL_MIN_OBSERVATIONS = int(os.getenv("RL_MIN_OBSERVATIONS", "2"))
+RL_SUCCESS_PRIOR = float(os.getenv("RL_SUCCESS_PRIOR", "1.0"))
+RL_FAILURE_PRIOR = float(os.getenv("RL_FAILURE_PRIOR", "1.0"))
 processed: set[str] = set()
 decisions: list[dict] = []
 last_recovery_at: dict[tuple[str, str], float] = {}
@@ -143,6 +150,95 @@ def render_playbook_value(value: Any, context: dict[str, Any]) -> Any:
     return value
 
 
+def canonical_target(action: dict[str, Any], fallback_target: str) -> str:
+    return str(action.get("target") or action.get("service_name") or fallback_target)
+
+
+def action_signature(classification: str, action: dict[str, Any], fallback_target: str) -> str:
+    target = canonical_target(action, fallback_target)
+    parts = [
+        str(classification or "unknown"),
+        str(action.get("action", "unknown")),
+        target,
+    ]
+    if "replicas" in action:
+        parts.append(f"replicas={action.get('replicas')}")
+    if "selector_value" in action:
+        parts.append(f"selector={action.get('selector_value')}")
+    return "|".join(parts)
+
+
+def action_feedback_stats() -> dict[str, dict[str, float]]:
+    items = recent_history("decision-log", FEEDBACK_WINDOW) or decisions
+    stats: dict[str, dict[str, float]] = {}
+    for item in items:
+        if item.get("suppressed"):
+            continue
+        event = item.get("event", {})
+        classification = str(event.get("classification", "unknown"))
+        actions = [action for action in item.get("actions", []) if isinstance(action, dict)]
+        results = item.get("results", [])
+        target = next(
+            (action.get("target") or action.get("service_name") for action in actions if action.get("target") or action.get("service_name")),
+            default_target_for(classification),
+        )
+        for index, action in enumerate(actions):
+            signature = action_signature(classification, action, str(target))
+            bucket = stats.setdefault(signature, {"successes": 0.0, "failures": 0.0, "observations": 0.0})
+            result = results[index] if index < len(results) and isinstance(results[index], dict) else {}
+            succeeded = result.get("status") != "failed"
+            bucket["observations"] += 1.0
+            if succeeded:
+                bucket["successes"] += 1.0
+            else:
+                bucket["failures"] += 1.0
+    return stats
+
+
+def action_score(classification: str, action: dict[str, Any], fallback_target: str, stats: dict[str, dict[str, float]]) -> float:
+    bucket = stats.get(action_signature(classification, action, fallback_target), {})
+    successes = float(bucket.get("successes", 0.0)) + RL_SUCCESS_PRIOR
+    failures = float(bucket.get("failures", 0.0)) + RL_FAILURE_PRIOR
+    return successes / max(successes + failures, 1.0)
+
+
+def explore_actions(event: dict, planned: list[dict], classification: str, fallback_target: str, stats: dict[str, dict[str, float]]) -> list[dict]:
+    if len(planned) < 2 or RL_EPSILON <= 0:
+        return planned
+    seed_material = str(event.get("ts") or event.get("classification") or time.time())
+    seed = int(hashlib.sha256(seed_material.encode()).hexdigest()[:8], 16)
+    if random.Random(seed).random() >= RL_EPSILON:
+        return planned
+    ranked = sorted(
+        planned,
+        key=lambda action: (
+            float(stats.get(action_signature(classification, action, fallback_target), {}).get("observations", 0.0)),
+            action_score(classification, action, fallback_target, stats),
+        ),
+    )
+    return ranked if ranked else planned
+
+
+def rank_actions_with_feedback(event: dict, planned: list[dict]) -> list[dict]:
+    if len(planned) < 2:
+        return planned
+    classification = str(event.get("classification", "unknown"))
+    fallback_target = next(
+        (action.get("target") or action.get("service_name") for action in planned if action.get("target") or action.get("service_name")),
+        default_target_for(classification),
+    )
+    stats = action_feedback_stats()
+    ranked = sorted(
+        planned,
+        key=lambda action: (
+            float(stats.get(action_signature(classification, action, str(fallback_target)), {}).get("observations", 0.0)) >= RL_MIN_OBSERVATIONS,
+            action_score(classification, action, str(fallback_target), stats),
+        ),
+        reverse=True,
+    )
+    return explore_actions(event, ranked, classification, str(fallback_target), stats)
+
+
 def plan_from_playbook(event: dict, target: str | None) -> list[dict]:
     actions = playbooks.get(str(event.get("classification")))
     if not actions:
@@ -162,22 +258,23 @@ def plan_actions(event: dict) -> list[dict]:
     target = attributed_target(event)
     configured = plan_from_playbook(event, target)
     if configured:
-        return configured
+        return rank_actions_with_feedback(event, configured)
+    planned: list[dict]
     if classification == "pod_instability":
-        return [{"action": "restart_deployment", "target": target or default_target_for(classification)}]
-    if classification == "latency_spike":
-        return [
+        planned = [{"action": "restart_deployment", "target": target or default_target_for(classification)}]
+    elif classification == "latency_spike":
+        planned = [
             {"action": "scale_deployment", "target": target or default_target_for(classification), "replicas": 3},
             {"action": "reset_latency", "target": target or default_target_for(classification)},
         ]
-    if classification == "availability_regression":
-        return [
+    elif classification == "availability_regression":
+        planned = [
             {"action": "clear_network_partition", "target": target or default_target_for(classification)},
             {"action": "restart_deployment", "target": target or default_target_for(classification)},
         ]
-    if classification == "application_error_burst" or sample.get("loki_errors", 0) > 4:
+    elif classification == "application_error_burst" or sample.get("loki_errors", 0) > 4:
         if target == "recommendation-service":
-            return [
+            planned = [
                 {
                     "action": "reroute_service",
                     "service_name": "recommendation-service",
@@ -185,52 +282,55 @@ def plan_actions(event: dict) -> list[dict]:
                 },
                 {"action": "restore_cache"},
             ]
-        return [
-            {"action": "restart_deployment", "target": target or default_target_for(classification)},
-        ]
-    if classification == "ddos_attack":
-        return [
+        else:
+            planned = [
+                {"action": "restart_deployment", "target": target or default_target_for(classification)},
+            ]
+    elif classification == "ddos_attack":
+        planned = [
             {"action": "apply_rate_limit", "target": target or default_target_for(classification)},
             {"action": "scale_under_ddos", "target": target or default_target_for(classification), "replicas": 6},
         ]
-    if classification == "mitm_attack":
-        return [
+    elif classification == "mitm_attack":
+        planned = [
             {"action": "enforce_mtls", "target": target or default_target_for(classification)},
             {"action": "rotate_certificates", "target": target or default_target_for(classification)},
         ]
-    if classification == "xss_attack":
-        return [
+    elif classification == "xss_attack":
+        planned = [
             {"action": "enable_waf_rules", "target": target or default_target_for(classification)},
         ]
-    if classification == "clickjacking_attack":
-        return [
+    elif classification == "clickjacking_attack":
+        planned = [
             {"action": "enforce_frame_policy", "target": target or default_target_for(classification)},
         ]
-    if classification == "csrf_attack":
-        return [
+    elif classification == "csrf_attack":
+        planned = [
             {"action": "lockdown_mutations", "target": target or default_target_for(classification)},
         ]
-    if classification == "session_hijacking_attack":
-        return [
+    elif classification == "session_hijacking_attack":
+        planned = [
             {"action": "quarantine_sessions", "target": target or default_target_for(classification)},
         ]
-    if classification == "credential_stuffing_attack":
-        return [
+    elif classification == "credential_stuffing_attack":
+        planned = [
             {"action": "throttle_authentication", "target": target or default_target_for(classification)},
         ]
-    if classification == "sqli_attack":
-        return [
+    elif classification == "sqli_attack":
+        planned = [
             {"action": "enable_sql_guard", "target": target or default_target_for(classification)},
         ]
-    if classification == "supply_chain_attack":
-        return [
+    elif classification == "supply_chain_attack":
+        planned = [
             {"action": "isolate_third_party_egress", "target": target or default_target_for(classification)},
         ]
-    if classification == "zero_day_attack":
-        return [
+    elif classification == "zero_day_attack":
+        planned = [
             {"action": "enable_emergency_patch_mode", "target": target or default_target_for(classification)},
         ]
-    return [{"action": "restart_deployment", "target": default_target_for(classification)}]
+    else:
+        planned = [{"action": "restart_deployment", "target": default_target_for(classification)}]
+    return rank_actions_with_feedback(event, planned)
 
 
 def is_in_cooldown(classification: str, target: str) -> bool:
@@ -389,6 +489,7 @@ async def feedback() -> dict:
     suppressed = 0
     latencies = []
     by_classification: dict[str, dict[str, Any]] = {}
+    action_preferences: dict[str, list[dict[str, Any]]] = {}
     for item in items:
         event = item.get("event", {})
         classification = event.get("classification", "unknown")
@@ -412,6 +513,29 @@ async def feedback() -> dict:
         else:
             failed += 1
             bucket["failed"] += 1
+    stats = action_feedback_stats()
+    grouped_action_preferences: dict[str, list[dict[str, Any]]] = {}
+    for signature, bucket in stats.items():
+        classification, action_name, target, *details = signature.split("|")
+        grouped_action_preferences.setdefault(classification, []).append(
+            {
+                "action": action_name,
+                "target": target,
+                "success_rate": round(
+                    (float(bucket.get("successes", 0.0)) + RL_SUCCESS_PRIOR)
+                    / max(float(bucket.get("observations", 0.0)) + RL_SUCCESS_PRIOR + RL_FAILURE_PRIOR, 1.0),
+                    4,
+                ),
+                "observations": int(bucket.get("observations", 0.0)),
+                "details": details,
+            }
+        )
+    for classification, action_items in grouped_action_preferences.items():
+        action_preferences[classification] = sorted(
+            action_items,
+            key=lambda item: (item["success_rate"], item["observations"]),
+            reverse=True,
+        )
     return {
         "total": total,
         "successful": successful,
@@ -420,4 +544,5 @@ async def feedback() -> dict:
         "success_rate": round(successful / max(total - suppressed, 1), 4),
         "avg_detection_to_action_seconds": round(sum(latencies) / len(latencies), 3) if latencies else 0.0,
         "by_classification": by_classification,
+        "action_preferences": action_preferences,
     }

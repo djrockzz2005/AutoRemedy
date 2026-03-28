@@ -16,6 +16,7 @@ from services.shared.audit import audit_event
 from services.shared.history import record_history, recent_history
 from services.shared.notifications import notification_worker, notify
 from services.shared.observability import install_observability, observe_event, traced_get
+from services.shared.security import increment_security_metric, record_request
 
 app = FastAPI(title="chaos-engine")
 logger = install_observability(app, "chaos-engine")
@@ -29,6 +30,44 @@ SCHEDULE_PATH = Path(os.getenv("CHAOS_SCHEDULE_PATH", "/app/config/chaos-schedul
 SCHEDULE_POLL_SECONDS = float(os.getenv("CHAOS_SCHEDULE_POLL_SECONDS", "5"))
 TELEMETRY_URL = os.getenv("TELEMETRY_URL", "http://telemetry-bridge:8000")
 schedule_state: dict[str, float] = {}
+
+
+def synthetic_target(request: ScenarioRequest, fallback: str) -> str:
+    return request.target or fallback
+
+
+def inject_ddos_telemetry(target: str, total_requests: int = 220, attacker_requests: int = 60, unique_ips: int = 80) -> dict[str, Any]:
+    generated_unique_ips = max(unique_ips, 1)
+    attacker_ip = "198.51.100.10"
+    for _ in range(max(attacker_requests, 1)):
+        record_request(target, attacker_ip, "/checkout", blocked=False)
+    remaining_requests = max(total_requests - max(attacker_requests, 1), 0)
+    for index in range(remaining_requests):
+        octet = 20 + (index % generated_unique_ips)
+        record_request(target, f"198.51.100.{octet}", "/checkout", blocked=index % 5 == 0)
+    increment_security_metric(target, "blocked_attempt_count", max(remaining_requests // 5, 1))
+    snapshot = record_request(target, "198.51.100.250", "/checkout", blocked=True)
+    return {
+        "target": target,
+        "requests_injected": total_requests + 1,
+        "attacker_requests": attacker_requests,
+        "simulated_unique_ips": generated_unique_ips + 1,
+        "window_seconds": 60,
+        "latest_security_buckets": len(snapshot.get("security_buckets", {})),
+    }
+
+
+def inject_xss_telemetry(target: str, attempts: int = 5) -> dict[str, Any]:
+    for index in range(max(attempts, 1)):
+        increment_security_metric(target, "xss_attempt_count")
+        if index % 2 == 0:
+            increment_security_metric(target, "blocked_attempt_count")
+        record_request(target, f"203.0.113.{10 + index}", "/search?q=<script>alert(1)</script>", blocked=index % 2 == 0)
+    return {
+        "target": target,
+        "attempts_injected": max(attempts, 1),
+        "blocked_attempts": max((attempts + 1) // 2, 1),
+    }
 
 
 def load_k8s() -> tuple[client.AppsV1Api, client.CoreV1Api, client.NetworkingV1Api, client.BatchV1Api]:
@@ -334,14 +373,17 @@ async def resource_pressure(request: ScenarioRequest) -> dict:
 
 @app.post("/scenarios/ddos-simulation")
 async def ddos_simulation(request: ScenarioRequest) -> dict:
+    target = synthetic_target(request, "api-gateway")
+    telemetry = inject_ddos_telemetry(target)
     observe_event("chaos-engine", "ddos_simulation_injected")
     return record(
         {
             "ts": datetime.now(timezone.utc).isoformat(),
             "scenario": "ddos-simulation",
-            "target": request.target,
+            "target": target,
             "namespace": target_namespace(request),
             "ip_range": request.ip_range or "198.51.100.0/24",
+            "telemetry": telemetry,
         }
     )
 
@@ -361,13 +403,16 @@ async def mitm_simulation(request: ScenarioRequest) -> dict:
 
 @app.post("/scenarios/xss-probe")
 async def xss_probe(request: ScenarioRequest) -> dict:
+    target = synthetic_target(request, "api-gateway")
+    telemetry = inject_xss_telemetry(target)
     observe_event("chaos-engine", "xss_probe_injected")
     return record(
         {
             "ts": datetime.now(timezone.utc).isoformat(),
             "scenario": "xss-probe",
-            "target": request.target,
+            "target": target,
             "namespace": target_namespace(request),
+            "telemetry": telemetry,
         }
     )
 

@@ -252,9 +252,11 @@ def summarise_service_state(state: dict[str, Any]) -> dict[str, float]:
         endpoint_counts = endpoint_buckets.get(second_key, {})
         if isinstance(ip_counts, dict):
             unique_ips.update(ip_counts.keys())
-            max_ip_rate = max(max_ip_rate, *(int(value) for value in ip_counts.values()), default=max_ip_rate)
+            candidate_ip_rates = [max_ip_rate, *(int(value) for value in ip_counts.values())]
+            max_ip_rate = max(candidate_ip_rates) if candidate_ip_rates else max_ip_rate
         if isinstance(endpoint_counts, dict):
-            endpoint_peak = max(endpoint_peak, *(int(value) for value in endpoint_counts.values()), default=endpoint_peak)
+            candidate_endpoint_rates = [endpoint_peak, *(int(value) for value in endpoint_counts.values())]
+            endpoint_peak = max(candidate_endpoint_rates) if candidate_endpoint_rates else endpoint_peak
         security_counts = security_buckets.get(second_key, {})
         if isinstance(security_counts, dict):
             for metric, value in security_counts.items():

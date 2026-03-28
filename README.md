@@ -11,6 +11,22 @@ This repository deploys a production-style microservice application on Kubernete
 5. `recovery-engine` executes recovery through the Kubernetes API.
 6. `dashboard` visualizes anomaly scores, decisions, and recovery timelines in real time.
 
+```mermaid
+flowchart LR
+    J[Judge triggers drill] --> C[chaos-engine]
+    C --> T[telemetry-bridge]
+    T --> A[anomaly-detector]
+    A --> D[decision-engine]
+    D --> R[recovery-engine]
+    R --> K[Kubernetes workloads]
+    K --> T
+    A --> UI[dashboard live view]
+    D --> UI
+    R --> UI
+    D --> F[feedback stats + action ranking]
+    F --> D
+```
+
 ## Microservices
 
 - `api-gateway`: public checkout API
@@ -55,6 +71,7 @@ pip install -r requirements.txt
 ```
 
 The bootstrap script downloads `kind` and `kubectl` into `.bin/`. The deploy path expects Docker access and outbound network access to fetch base container images.
+`./scripts/demo.sh` now runs a 60-second live demo loop by default, and it also supports `./scripts/demo.sh all`, `./scripts/demo.sh attacks`, or `./scripts/demo.sh faults` to walk judges through multiple scenarios while they watch the dashboard at `http://localhost:8080`.
 
 ## Telemetry APIs
 
@@ -91,6 +108,7 @@ Security telemetry is also merged into the same samples, including `requests_per
 - `PLAYBOOK_PATH` points to the YAML file to load. Default: `/app/config/playbooks.yaml`.
 - Playbook templates can interpolate `{target}` and `{classification}` into action payloads.
 - Default playbooks now cover `ddos_attack`, `mitm_attack`, `xss_attack`, `clickjacking_attack`, and `csrf_attack`.
+- When multiple actions are available for the same classification, the decision engine now reorders them with a lightweight epsilon-greedy bandit using recent remediation outcomes from `GET /feedback`.
 
 ## Security Loop
 
@@ -98,6 +116,7 @@ Security telemetry is also merged into the same samples, including `requests_per
 - `dashboard` now emits clickjacking and CSRF telemetry, serves strict security headers, and requires CSRF tokens on state-changing authenticated requests.
 - `recovery-engine` can apply temporary security posture changes and automatically relax them once telemetry indicates the attack has subsided.
 - `chaos-engine` exposes `ddos-simulation`, `mitm-simulation`, `xss-probe`, `clickjacking-probe`, and `csrf-probe` scenarios for closed-loop validation.
+- `ddos-simulation` and `xss-probe` now inject synthetic security telemetry into the shared security store, so the anomaly detector can classify them and drive end-to-end remediation during a live demo.
 - The platform also tracks newer attack families including AitM/TLS downgrade variants, session hijacking, credential stuffing, SQLi, supply-chain risk, and zero-day guard signals.
 - `api-gateway` now emits HSTS and detects TLS downgrade headers, DNS/ARP spoof hints, rogue Wi-Fi markers, SQLi payloads, and supply-chain / zero-day guard headers.
 - `dashboard` now tracks failed-login bursts for credential stuffing and binds active sessions to IP plus user-agent to surface session hijack signals.
@@ -132,7 +151,7 @@ Security telemetry is also merged into the same samples, including `requests_per
 ## Feedback Metrics
 
 - `GET /feedback` on `decision-engine` summarizes recent remediation success rate, suppression count, and per-classification execution outcomes.
-- This is a rule-feedback loop rather than full reinforcement learning, but it now gives operators a concrete signal about which remediations are helping versus failing.
+- The same feedback data now feeds a lightweight reinforcement loop: action success history is converted into per-classification preferences, and multi-step remediations are dynamically reordered to favor the actions that have been working best while still exploring alternatives.
 
 ## Auth
 

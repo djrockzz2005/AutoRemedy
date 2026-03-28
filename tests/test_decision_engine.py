@@ -147,6 +147,45 @@ class DecisionEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(actions[0]["target"], "api-gateway")
         self.assertEqual(actions[1]["action"], "scale_under_ddos")
 
+    def test_plan_actions_reorders_multi_step_playbook_from_feedback(self) -> None:
+        MODULE.decisions.extend(
+            [
+                {
+                    "event": {"classification": "availability_regression"},
+                    "actions": [
+                        {"action": "clear_network_partition", "target": "payment-service"},
+                        {"action": "restart_deployment", "target": "payment-service"},
+                    ],
+                    "results": [
+                        {"status": "failed"},
+                        {"status": "completed"},
+                    ],
+                },
+                {
+                    "event": {"classification": "availability_regression"},
+                    "actions": [
+                        {"action": "clear_network_partition", "target": "payment-service"},
+                        {"action": "restart_deployment", "target": "payment-service"},
+                    ],
+                    "results": [
+                        {"status": "failed"},
+                        {"status": "completed"},
+                    ],
+                },
+            ]
+        )
+        event = {
+            "classification": "availability_regression",
+            "per_service": {"services": {"payment-service": {"availability": 0.82, "error_rate": 0.4}}},
+            "sample": {},
+        }
+
+        with patch.object(MODULE, "recent_history", return_value=[]), patch.object(MODULE, "RL_EPSILON", 0.0):
+            actions = MODULE.plan_actions(event)
+
+        self.assertEqual(actions[0]["action"], "restart_deployment")
+        self.assertEqual(actions[1]["action"], "clear_network_partition")
+
     def test_default_target_for_security_classifications(self) -> None:
         self.assertEqual(MODULE.default_target_for("mitm_attack"), "api-gateway")
         self.assertEqual(MODULE.default_target_for("clickjacking_attack"), "dashboard")
@@ -201,6 +240,28 @@ class DecisionEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(MODULE.decisions[0]["actions"][0]["target"], "payment-service")
         self.assertEqual(FakeAsyncClient.posted_payloads[0][0], f"{MODULE.RECOVERY_URL}/recover")
         self.assertEqual(FakeAsyncClient.posted_payloads[0][1]["reason"], "pod_instability")
+
+    async def test_feedback_exposes_ranked_action_preferences(self) -> None:
+        MODULE.decisions.extend(
+            [
+                {
+                    "event": {"classification": "ddos_attack"},
+                    "actions": [{"action": "apply_rate_limit", "target": "api-gateway"}],
+                    "results": [{"status": "completed"}],
+                },
+                {
+                    "event": {"classification": "ddos_attack"},
+                    "actions": [{"action": "scale_under_ddos", "target": "api-gateway", "replicas": 6}],
+                    "results": [{"status": "failed"}],
+                },
+            ]
+        )
+
+        with patch.object(MODULE, "recent_history", return_value=[]):
+            payload = await MODULE.feedback()
+
+        self.assertIn("ddos_attack", payload["action_preferences"])
+        self.assertEqual(payload["action_preferences"]["ddos_attack"][0]["action"], "apply_rate_limit")
 
 
 if __name__ == "__main__":
