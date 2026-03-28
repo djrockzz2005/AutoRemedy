@@ -72,6 +72,17 @@ FEATURE_KEYS = [
     "blocked_attempt_count",
     "request_rate_peak_per_endpoint",
     "active_mitigations",
+    "session_hijack_attempt_count",
+    "credential_stuffing_attempt_count",
+    "sqli_attempt_count",
+    "tls_downgrade_attempt_count",
+    "dns_spoof_attempt_count",
+    "arp_spoof_attempt_count",
+    "rogue_wifi_attempt_count",
+    "aitm_phishing_attempt_count",
+    "supply_chain_risk_count",
+    "zero_day_signal_count",
+    "credential_target_count",
 ]
 
 
@@ -96,14 +107,29 @@ def rule_based_classify(sample: dict) -> str:
         float(sample.get("tls_handshake_failures", 0.0)) > 0.0
         or float(sample.get("certificate_mismatch_count", 0.0)) > 0.0
         or float(sample.get("unexpected_certificate_fingerprints", 0.0)) > 0.0
+        or float(sample.get("tls_downgrade_attempt_count", 0.0)) > 0.0
+        or float(sample.get("dns_spoof_attempt_count", 0.0)) > 0.0
+        or float(sample.get("arp_spoof_attempt_count", 0.0)) > 0.0
+        or float(sample.get("rogue_wifi_attempt_count", 0.0)) > 0.0
+        or float(sample.get("aitm_phishing_attempt_count", 0.0)) > 0.0
     ):
         return "mitm_attack"
+    if float(sample.get("session_hijack_attempt_count", 0.0)) > 0.0:
+        return "session_hijacking_attack"
+    if float(sample.get("credential_stuffing_attempt_count", 0.0)) > 0.0:
+        return "credential_stuffing_attack"
+    if float(sample.get("sqli_attempt_count", 0.0)) > 0.0:
+        return "sqli_attack"
     if float(sample.get("xss_attempt_count", 0.0)) >= float(os.getenv("XSS_ATTACK_THRESHOLD", "1")):
         return "xss_attack"
     if float(sample.get("clickjack_attempt_count", 0.0)) >= float(os.getenv("CLICKJACK_ATTACK_THRESHOLD", "1")):
         return "clickjacking_attack"
     if float(sample.get("csrf_attempt_count", 0.0)) >= float(os.getenv("CSRF_ATTACK_THRESHOLD", "1")):
         return "csrf_attack"
+    if float(sample.get("supply_chain_risk_count", 0.0)) > 0.0:
+        return "supply_chain_attack"
+    if float(sample.get("zero_day_signal_count", 0.0)) > 0.0:
+        return "zero_day_attack"
     if sample.get("error_rate", 0) > 0.5 or sample.get("availability", 1) < 0.9:
         return "availability_regression"
     if sample.get("latency_p95", 0) > 1.2:
@@ -271,6 +297,11 @@ def low_signal_sample(sample: dict) -> bool:
         and float(sample.get("clickjack_attempt_count", 0.0)) <= 0.0
         and float(sample.get("tls_handshake_failures", 0.0)) <= 0.0
         and float(sample.get("requests_per_ip_per_second", 0.0)) <= 0.0
+        and float(sample.get("credential_stuffing_attempt_count", 0.0)) <= 0.0
+        and float(sample.get("sqli_attempt_count", 0.0)) <= 0.0
+        and float(sample.get("session_hijack_attempt_count", 0.0)) <= 0.0
+        and float(sample.get("supply_chain_risk_count", 0.0)) <= 0.0
+        and float(sample.get("zero_day_signal_count", 0.0)) <= 0.0
     )
 
 

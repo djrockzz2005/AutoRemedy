@@ -98,6 +98,9 @@ Security telemetry is also merged into the same samples, including `requests_per
 - `dashboard` now emits clickjacking and CSRF telemetry, serves strict security headers, and requires CSRF tokens on state-changing authenticated requests.
 - `recovery-engine` can apply temporary security posture changes and automatically relax them once telemetry indicates the attack has subsided.
 - `chaos-engine` exposes `ddos-simulation`, `mitm-simulation`, `xss-probe`, `clickjacking-probe`, and `csrf-probe` scenarios for closed-loop validation.
+- The platform also tracks newer attack families including AitM/TLS downgrade variants, session hijacking, credential stuffing, SQLi, supply-chain risk, and zero-day guard signals.
+- `api-gateway` now emits HSTS and detects TLS downgrade headers, DNS/ARP spoof hints, rogue Wi-Fi markers, SQLi payloads, and supply-chain / zero-day guard headers.
+- `dashboard` now tracks failed-login bursts for credential stuffing and binds active sessions to IP plus user-agent to surface session hijack signals.
 
 ## Alerting And Audit
 
@@ -200,8 +203,10 @@ Security telemetry is also merged into the same samples, including `requests_per
 - `DDOS_SYN_FLOOD_SCORE_THRESHOLD`: anomaly rule threshold for SYN-flood style traffic. Default: `0.4`
 - `XSS_PATTERN_STRICTNESS`: gateway inspection mode. Default: `strict`
 - `CSRF_TOKEN_TTL_SECONDS`: dashboard CSRF token lifetime. Default: `1800`
+- `CREDENTIAL_STUFFING_THRESHOLD`: failed login attempts in the dashboard window before credential-stuffing telemetry is emitted. Default: `5`
 - `SECURITY_WINDOW_SECONDS`: shared security telemetry rolling window. Default: `60`
 - `SECURITY_POSTURE_COOLDOWN_SECONDS`: minimum hold time before auto-relaxing temporary mitigations. Default: `90`
+- `EXPECTED_PUBLIC_HOSTS`: accepted external hosts for anti-downgrade / DNS-spoof checks. Default: `localhost,api-gateway,dashboard`
 
 ## Operations
 

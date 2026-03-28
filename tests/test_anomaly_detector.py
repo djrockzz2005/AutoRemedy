@@ -105,6 +105,11 @@ class AnomalyDetectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(MODULE.rule_based_classify({"clickjack_attempt_count": 1}), "clickjacking_attack")
         self.assertEqual(MODULE.rule_based_classify({"csrf_attempt_count": 1}), "csrf_attack")
 
+    def test_rule_based_classify_detects_session_and_sqli_attacks(self) -> None:
+        self.assertEqual(MODULE.rule_based_classify({"session_hijack_attempt_count": 1}), "session_hijacking_attack")
+        self.assertEqual(MODULE.rule_based_classify({"credential_stuffing_attempt_count": 3}), "credential_stuffing_attack")
+        self.assertEqual(MODULE.rule_based_classify({"sqli_attempt_count": 1}), "sqli_attack")
+
     async def test_detect_loop_records_event_from_mocked_telemetry(self) -> None:
         sample = {
             "ts": "2026-03-28T12:00:00+00:00",

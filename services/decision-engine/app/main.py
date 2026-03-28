@@ -80,6 +80,16 @@ def attributed_target(event: dict) -> str | None:
         return top_service(per_service, "clickjack_attempt_count", True)
     if classification == "csrf_attack":
         return top_service(per_service, "csrf_attempt_count", True)
+    if classification == "session_hijacking_attack":
+        return top_service(per_service, "session_hijack_attempt_count", True)
+    if classification == "credential_stuffing_attack":
+        return top_service(per_service, "credential_stuffing_attempt_count", True)
+    if classification == "sqli_attack":
+        return top_service(per_service, "sqli_attempt_count", True)
+    if classification == "supply_chain_attack":
+        return top_service(per_service, "supply_chain_risk_count", True)
+    if classification == "zero_day_attack":
+        return top_service(per_service, "zero_day_signal_count", True)
     return None
 
 
@@ -94,6 +104,11 @@ def default_target_for(classification: str | None) -> str:
         "xss_attack": "api-gateway",
         "clickjacking_attack": "dashboard",
         "csrf_attack": "dashboard",
+        "session_hijacking_attack": "dashboard",
+        "credential_stuffing_attack": "dashboard",
+        "sqli_attack": "api-gateway",
+        "supply_chain_attack": "api-gateway",
+        "zero_day_attack": "api-gateway",
     }.get(classification or "", "api-gateway")
 
 
@@ -194,6 +209,26 @@ def plan_actions(event: dict) -> list[dict]:
     if classification == "csrf_attack":
         return [
             {"action": "lockdown_mutations", "target": target or default_target_for(classification)},
+        ]
+    if classification == "session_hijacking_attack":
+        return [
+            {"action": "quarantine_sessions", "target": target or default_target_for(classification)},
+        ]
+    if classification == "credential_stuffing_attack":
+        return [
+            {"action": "throttle_authentication", "target": target or default_target_for(classification)},
+        ]
+    if classification == "sqli_attack":
+        return [
+            {"action": "enable_sql_guard", "target": target or default_target_for(classification)},
+        ]
+    if classification == "supply_chain_attack":
+        return [
+            {"action": "isolate_third_party_egress", "target": target or default_target_for(classification)},
+        ]
+    if classification == "zero_day_attack":
+        return [
+            {"action": "enable_emergency_patch_mode", "target": target or default_target_for(classification)},
         ]
     return [{"action": "restart_deployment", "target": default_target_for(classification)}]
 

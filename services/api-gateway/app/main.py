@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -16,6 +17,7 @@ from services.shared.security import (
     get_controls,
     increment_security_metric,
     payload_has_xss,
+    payload_has_sqli,
     record_certificate_fingerprint,
     record_request,
     suspicious_forwarded_chain,
@@ -29,6 +31,8 @@ RECOMMENDATION_SERVICE = os.getenv("RECOMMENDATION_SERVICE_URL", "http://recomme
 DDOS_RATE_LIMIT_PER_IP = int(os.getenv("DDOS_RATE_LIMIT_PER_IP", "20"))
 XSS_PATTERN_STRICTNESS = os.getenv("XSS_PATTERN_STRICTNESS", "strict")
 ALLOWED_ORIGINS = [item.strip() for item in os.getenv("SECURITY_ALLOWED_ORIGINS", "http://localhost,http://dashboard").split(",") if item.strip()]
+EXPECTED_PUBLIC_HOSTS = [item.strip() for item in os.getenv("EXPECTED_PUBLIC_HOSTS", "localhost,api-gateway,dashboard").split(",") if item.strip()]
+CSP_HEADER = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'"
 
 
 class CheckoutRequest(BaseModel):
@@ -91,6 +95,24 @@ def origin_allowed(request: Request) -> bool:
     return any(host in (origin or referer or "") for host in ALLOWED_ORIGINS)
 
 
+def suspicious_transport_or_network(request: Request) -> list[tuple[int, str, str, str]]:
+    findings: list[tuple[int, str, str, str]] = []
+    proto = request.headers.get("x-forwarded-proto", "https").lower()
+    host = request.headers.get("host", "")
+    forwarded_host = request.headers.get("x-forwarded-host", host)
+    if proto == "http":
+        findings.append((400, "tls_downgrade_detected", "tls_downgrade_attempt_count", "mitm_attack"))
+    if forwarded_host and not any(expected in forwarded_host for expected in EXPECTED_PUBLIC_HOSTS):
+        findings.append((400, "dns_host_mismatch", "dns_spoof_attempt_count", "mitm_attack"))
+    if request.headers.get("x-evil-twin", "").lower() == "true":
+        findings.append((403, "rogue_wifi_detected", "rogue_wifi_attempt_count", "mitm_attack"))
+    if request.headers.get("x-arp-spoofed", "").lower() == "true":
+        findings.append((403, "arp_spoof_detected", "arp_spoof_attempt_count", "mitm_attack"))
+    if request.headers.get("x-aitm-proxy", "").lower() == "true":
+        findings.append((403, "aitm_proxy_detected", "aitm_phishing_attempt_count", "mitm_attack"))
+    return findings
+
+
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
     body = await request.body()
@@ -100,6 +122,9 @@ async def security_middleware(request: Request, call_next):
 
     if suspicious_forwarded_chain(dict(request.headers)):
         return await reject_request(request, 400, "suspicious_proxy_headers", "tls_handshake_failures", "mitm_attack")
+
+    for status_code, detail, metric, classification in suspicious_transport_or_network(request):
+        return await reject_request(request, status_code, detail, metric, classification)
 
     if mutation_request(request) and not origin_allowed(request):
         return await reject_request(request, 403, "origin_not_allowed", "csrf_attempt_count", "csrf_attack")
@@ -113,6 +138,16 @@ async def security_middleware(request: Request, call_next):
         increment_security_metric("api-gateway", "xss_attempt_count")
         if waf_strict:
             return await reject_request(request, 400, "xss_payload_rejected", "xss_attempt_count", "xss_attack")
+    if payload_text and payload_has_sqli(payload_text):
+        increment_security_metric("api-gateway", "sqli_attempt_count")
+        if controls.get("sql_guard", {}).get("enabled") or True:
+            return await reject_request(request, 400, "sqli_payload_rejected", "sqli_attempt_count", "sqli_attack")
+    if request.headers.get("x-supply-chain-risk", "").lower() == "true":
+        increment_security_metric("api-gateway", "supply_chain_risk_count")
+        return await reject_request(request, 503, "supply_chain_risk_detected", "supply_chain_risk_count", "supply_chain_attack")
+    if request.headers.get("x-zero-day-suspected", "").lower() == "true":
+        increment_security_metric("api-gateway", "zero_day_signal_count")
+        return await reject_request(request, 503, "zero_day_guard_triggered", "zero_day_signal_count", "zero_day_attack")
 
     service_snapshot = record_request("api-gateway", ip, request.url.path)
     second = str(int(__import__("time").time()))
@@ -126,10 +161,12 @@ async def security_middleware(request: Request, call_next):
 
     request._receive = receive
     response = await call_next(request)
-    response.headers["Content-Security-Policy"] = "default-src 'self'; frame-ancestors 'none'"
+    response.headers["Content-Security-Policy"] = CSP_HEADER
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-XSS-Protection"] = "1; mode=block"
     response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains; preload"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     return response
 
 

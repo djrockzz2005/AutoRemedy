@@ -37,6 +37,12 @@ class DashboardAuthTests(unittest.TestCase):
 
         self.assertTrue(module.validate_csrf_token(request, "operator"))
 
+    def test_session_binding_id_extracts_signed_session_identifier(self) -> None:
+        module = load_module("services/dashboard/app/main.py", "dashboard_main_session_binding")
+        value = "operator:nonce:signature"
+
+        self.assertEqual(module.session_binding_id(value), value)
+
 
 if __name__ == "__main__":
     unittest.main()

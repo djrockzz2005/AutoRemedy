@@ -144,6 +144,16 @@ async def run_scenario_by_name(name: str, payload: dict[str, Any]) -> dict:
         return await clickjacking_probe(request)
     if name == "csrf-probe":
         return await csrf_probe(request)
+    if name == "session-hijack-probe":
+        return await session_hijack_probe(request)
+    if name == "credential-stuffing-probe":
+        return await credential_stuffing_probe(request)
+    if name == "sqli-probe":
+        return await sqli_probe(request)
+    if name == "supply-chain-probe":
+        return await supply_chain_probe(request)
+    if name == "zero-day-probe":
+        return await zero_day_probe(request)
     raise HTTPException(status_code=400, detail=f"unknown_scenario:{name}")
 
 
@@ -382,6 +392,71 @@ async def csrf_probe(request: ScenarioRequest) -> dict:
         {
             "ts": datetime.now(timezone.utc).isoformat(),
             "scenario": "csrf-probe",
+            "target": request.target,
+            "namespace": target_namespace(request),
+        }
+    )
+
+
+@app.post("/scenarios/session-hijack-probe")
+async def session_hijack_probe(request: ScenarioRequest) -> dict:
+    observe_event("chaos-engine", "session_hijack_probe_injected")
+    return record(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "scenario": "session-hijack-probe",
+            "target": request.target,
+            "namespace": target_namespace(request),
+        }
+    )
+
+
+@app.post("/scenarios/credential-stuffing-probe")
+async def credential_stuffing_probe(request: ScenarioRequest) -> dict:
+    observe_event("chaos-engine", "credential_stuffing_probe_injected")
+    return record(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "scenario": "credential-stuffing-probe",
+            "target": request.target,
+            "namespace": target_namespace(request),
+        }
+    )
+
+
+@app.post("/scenarios/sqli-probe")
+async def sqli_probe(request: ScenarioRequest) -> dict:
+    observe_event("chaos-engine", "sqli_probe_injected")
+    return record(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "scenario": "sqli-probe",
+            "target": request.target,
+            "namespace": target_namespace(request),
+        }
+    )
+
+
+@app.post("/scenarios/supply-chain-probe")
+async def supply_chain_probe(request: ScenarioRequest) -> dict:
+    observe_event("chaos-engine", "supply_chain_probe_injected")
+    return record(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "scenario": "supply-chain-probe",
+            "target": request.target,
+            "namespace": target_namespace(request),
+        }
+    )
+
+
+@app.post("/scenarios/zero-day-probe")
+async def zero_day_probe(request: ScenarioRequest) -> dict:
+    observe_event("chaos-engine", "zero_day_probe_injected")
+    return record(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "scenario": "zero-day-probe",
             "target": request.target,
             "namespace": target_namespace(request),
         }

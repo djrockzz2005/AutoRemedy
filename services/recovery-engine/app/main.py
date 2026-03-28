@@ -375,6 +375,50 @@ async def recover(request: RecoveryRequest) -> dict:
             patch = {"spec": {"template": {"spec": {"containers": containers}}}}
             apps_api.patch_namespaced_deployment(request.target, namespace, patch)
             set_control(request.target, "lockdown_mutations", False)
+        elif request.action == "quarantine_sessions":
+            if not request.target:
+                raise HTTPException(status_code=400, detail="target_required")
+            set_control(request.target, "quarantine_sessions", True)
+        elif request.action == "throttle_authentication":
+            if not request.target:
+                raise HTTPException(status_code=400, detail="target_required")
+            deployment = apps_api.read_namespaced_deployment(request.target, namespace)
+            containers = patch_env(deployment.spec.template.spec.containers, request.container_name, "AUTH_RATE_LIMIT_MODE", "strict")
+            patch = {"spec": {"template": {"spec": {"containers": containers}}}}
+            apps_api.patch_namespaced_deployment(request.target, namespace, patch)
+            set_control(request.target, "auth_rate_limit", True)
+        elif request.action == "enable_sql_guard":
+            if not request.target:
+                raise HTTPException(status_code=400, detail="target_required")
+            deployment = apps_api.read_namespaced_deployment(request.target, namespace)
+            containers = patch_env(deployment.spec.template.spec.containers, request.container_name, "SQL_GUARD_MODE", "strict")
+            patch = {"spec": {"template": {"spec": {"containers": containers}}}}
+            apps_api.patch_namespaced_deployment(request.target, namespace, patch)
+            set_control(request.target, "sql_guard", True)
+        elif request.action == "isolate_third_party_egress":
+            if not request.target:
+                raise HTTPException(status_code=400, detail="target_required")
+            policy = client.V1NetworkPolicy(
+                metadata=client.V1ObjectMeta(name=f"{request.target}-egress-lockdown"),
+                spec=client.V1NetworkPolicySpec(
+                    pod_selector=client.V1LabelSelector(match_labels={"app": request.target}),
+                    policy_types=["Egress"],
+                    egress=[],
+                ),
+            )
+            try:
+                net_api.replace_namespaced_network_policy(f"{request.target}-egress-lockdown", namespace, policy)
+            except Exception:
+                net_api.create_namespaced_network_policy(namespace, policy)
+            set_control(request.target, "egress_lockdown", True)
+        elif request.action == "enable_emergency_patch_mode":
+            if not request.target:
+                raise HTTPException(status_code=400, detail="target_required")
+            deployment = apps_api.read_namespaced_deployment(request.target, namespace)
+            containers = patch_env(deployment.spec.template.spec.containers, request.container_name, "EMERGENCY_PATCH_MODE", "true")
+            patch = {"spec": {"template": {"spec": {"containers": containers}}}}
+            apps_api.patch_namespaced_deployment(request.target, namespace, patch)
+            set_control(request.target, "emergency_patch_mode", True)
         else:
             raise HTTPException(status_code=400, detail="unknown_action")
         observe_event("recovery-engine", "recovery_executed")

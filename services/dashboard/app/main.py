@@ -23,7 +23,15 @@ from services.shared.migrations import migrate
 from services.shared.maintenance import prune_tables
 from services.shared.notifications import notification_worker
 from services.shared.observability import install_observability, traced_get, traced_post
-from services.shared.security import get_controls, increment_security_metric, payload_has_xss, record_request, suspicious_embedding_request
+from services.shared.security import (
+    bind_session,
+    get_controls,
+    increment_security_metric,
+    payload_has_xss,
+    record_identity_attempt,
+    record_request,
+    suspicious_embedding_request,
+)
 from services.shared.store import ensure_table, pg_conn
 
 app = FastAPI(title="dashboard")
@@ -47,6 +55,8 @@ AUTH_MIN_PASSWORD_LENGTH = int(os.getenv("DASHBOARD_MIN_PASSWORD_LENGTH", "8"))
 CSRF_COOKIE_NAME = os.getenv("DASHBOARD_CSRF_COOKIE", "dashboard_csrf")
 CSRF_TOKEN_TTL_SECONDS = int(os.getenv("CSRF_TOKEN_TTL_SECONDS", "1800"))
 ALLOWED_EMBED_HOSTS = [item.strip() for item in os.getenv("DASHBOARD_ALLOWED_HOSTS", "localhost,dashboard").split(",") if item.strip()]
+CREDENTIAL_STUFFING_THRESHOLD = int(os.getenv("CREDENTIAL_STUFFING_THRESHOLD", "5"))
+CSP_HEADER = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'"
 
 
 def dashboard_db():
@@ -105,6 +115,16 @@ def username_from_session(value: str | None) -> str | None:
     if not hmac.compare_digest(signature, expected):
         return None
     return normalize_username(username)
+
+
+def session_binding_id(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        username, issued_at, signature = value.split(":", 2)
+    except ValueError:
+        return None
+    return f"{normalize_username(username)}:{issued_at}:{signature}"
 
 
 def authenticated_username(request: Request) -> str | None:
@@ -707,7 +727,7 @@ HTML = r"""
           : 'Autonomous remediation idle';
         document.getElementById('latencyMeta').textContent = `Availability ${(latestSample.availability || 1).toFixed(2)}`;
         document.getElementById('sloMeta').textContent = (sloStatus.items || []).some(item => !item.healthy) ? 'SLO violations active' : 'Error budget healthy';
-        const activeSecurityEvent = (data.events || []).slice().reverse().find(item => ['ddos_attack', 'mitm_attack', 'xss_attack', 'clickjacking_attack', 'csrf_attack'].includes(item.classification));
+        const activeSecurityEvent = (data.events || []).slice().reverse().find(item => ['ddos_attack', 'mitm_attack', 'xss_attack', 'clickjacking_attack', 'csrf_attack', 'session_hijacking_attack', 'credential_stuffing_attack', 'sqli_attack', 'supply_chain_attack', 'zero_day_attack'].includes(item.classification));
         const blockedAttempts = Math.round(latestSample.blocked_attempt_count || 0);
         const activeMitigations = Math.round(latestSample.active_mitigations || 0);
         document.getElementById('securityStatus').textContent = activeSecurityEvent ? classificationLabel(activeSecurityEvent.classification) : 'Nominal';
@@ -1219,9 +1239,10 @@ async def auth_middleware(request: Request, call_next):
     if not request.url.path.startswith("/api/") or request.url.path.startswith("/api/auth/"):
         response = await call_next(request)
         response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Content-Security-Policy"] = "default-src 'self'; frame-ancestors 'none'"
+        response.headers["Content-Security-Policy"] = CSP_HEADER
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains; preload"
         return response
     principal = authenticated_username(request)
     role = ROLE_ADMIN if principal else None
@@ -1232,6 +1253,22 @@ async def auth_middleware(request: Request, call_next):
             principal = request.headers.get("x-actor", f"api-key:{role or 'anonymous'}") if role else None
     if principal is None:
         raise HTTPException(status_code=401, detail="login_required")
+    session_id = session_binding_id(request.cookies.get(SESSION_COOKIE_NAME))
+    request_ip = getattr(getattr(request, "client", None), "host", "unknown")
+    user_agent = request.headers.get("user-agent", "unknown")
+    if session_id and bind_session(session_id, request_ip, user_agent):
+        increment_security_metric("dashboard", "session_hijack_attempt_count")
+        audit_event(
+            "dashboard",
+            "session-hijack-detected",
+            {"path": request.url.path, "actor": principal, "ip": request_ip},
+            severity="critical",
+            status="blocked",
+            target=request.url.path,
+            classification="session_hijacking_attack",
+            actor=principal,
+        )
+        raise HTTPException(status_code=401, detail="session_binding_changed")
     if request.method in {"POST", "PUT", "PATCH", "DELETE"} and not validate_csrf_token(request, principal):
         increment_security_metric("dashboard", "csrf_attempt_count")
         audit_event(
@@ -1249,9 +1286,10 @@ async def auth_middleware(request: Request, call_next):
     request.state.role = role or ROLE_ADMIN
     response = await call_next(request)
     response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Content-Security-Policy"] = "default-src 'self'; frame-ancestors 'none'"
+    response.headers["Content-Security-Policy"] = CSP_HEADER
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains; preload"
     return response
 
 
@@ -1293,12 +1331,23 @@ async def signup(payload: dict[str, str], response: Response) -> dict:
 @app.post("/api/auth/login")
 async def login(payload: dict[str, str], response: Response) -> dict:
     username, password = validate_credentials(payload.get("username", ""), payload.get("password", ""))
+    request_identity = normalize_username(username)
     with dashboard_db() as connection:
         with connection.cursor() as cursor:
             cursor.execute("SELECT username, password_hash FROM dashboard_users WHERE username = %s", (username,))
             user = cursor.fetchone()
     if not user or not verify_password(password, user["password_hash"]):
+        state = record_identity_attempt("dashboard", request_identity, "failed")
+        failures = 0
+        for outcomes in state.get("identity_buckets", {}).values():
+            if isinstance(outcomes, dict):
+                actor_bucket = outcomes.get(request_identity, {})
+                if isinstance(actor_bucket, dict):
+                    failures += int(actor_bucket.get("failed", 0))
+        if failures >= CREDENTIAL_STUFFING_THRESHOLD:
+            increment_security_metric("dashboard", "credential_stuffing_attempt_count")
         raise HTTPException(status_code=401, detail="invalid_username_or_password")
+    record_identity_attempt("dashboard", request_identity, "success")
     apply_session_cookies(response, username)
     return {"username": username, "csrf_token": csrf_token_value(username)}
 

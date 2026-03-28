@@ -29,7 +29,19 @@ XSS_PATTERNS = [
         r"<\s*iframe",
     )
 ]
+SQLI_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"(\bunion\b.*\bselect\b)",
+        r"(\bor\b\s+1=1)",
+        r"(--|/\*|\*/|;)",
+        r"(\bdrop\b\s+\btable\b)",
+        r"(\binformation_schema\b)",
+        r"(sleep\s*\(|benchmark\s*\()",
+    )
+]
 _MEMORY_STATE: dict[str, dict[str, Any]] = {}
+_SESSION_BINDINGS: dict[str, dict[str, str]] = {}
 
 
 def _now() -> int:
@@ -45,6 +57,7 @@ def _default_service_state() -> dict[str, Any]:
         "security_buckets": {},
         "cert_fingerprints": [],
         "controls": {},
+        "identity_buckets": {},
     }
 
 
@@ -62,7 +75,7 @@ def _normalise_state(state: dict[str, Any] | None) -> dict[str, Any]:
     merged = _default_service_state()
     if isinstance(state, dict):
         merged.update(state)
-    for key in ("request_buckets", "ip_buckets", "endpoint_buckets", "security_buckets", "controls"):
+    for key in ("request_buckets", "ip_buckets", "endpoint_buckets", "security_buckets", "controls", "identity_buckets"):
         if not isinstance(merged.get(key), dict):
             merged[key] = {}
     if not isinstance(merged.get("cert_fingerprints"), list):
@@ -97,6 +110,7 @@ def update_service_state(service: str, updater) -> dict[str, Any]:
     _cleanup_bucket_map(state["ip_buckets"], now)
     _cleanup_bucket_map(state["endpoint_buckets"], now)
     _cleanup_bucket_map(state["security_buckets"], now)
+    _cleanup_bucket_map(state["identity_buckets"], now)
     updater(state, now)
     _save_service_state(service, state)
     return state
@@ -138,6 +152,29 @@ def increment_security_metric(service: str, metric: str, amount: int = 1) -> dic
         security_bucket[metric_key] = int(security_bucket.get(metric_key, 0)) + amount
 
     return update_service_state(service, updater)
+
+
+def record_identity_attempt(service: str, identity: str, outcome: str) -> dict[str, Any]:
+    actor = identity.strip().lower() or "anonymous"
+
+    def updater(state: dict[str, Any], now: int) -> None:
+        second = str(now)
+        identity_bucket = state["identity_buckets"].setdefault(second, {})
+        actor_bucket = identity_bucket.setdefault(actor, {})
+        actor_bucket[outcome] = int(actor_bucket.get(outcome, 0)) + 1
+
+    return update_service_state(service, updater)
+
+
+def bind_session(session_id: str, ip: str, user_agent: str) -> bool:
+    binding = _SESSION_BINDINGS.get(session_id)
+    current = {"ip": ip, "user_agent": user_agent}
+    if binding is None:
+        _SESSION_BINDINGS[session_id] = current
+        return False
+    suspicious = binding.get("ip") != ip or binding.get("user_agent") != user_agent
+    _SESSION_BINDINGS[session_id] = current
+    return suspicious
 
 
 def record_certificate_fingerprint(service: str, fingerprint: str) -> dict[str, Any]:
@@ -200,11 +237,14 @@ def summarise_service_state(state: dict[str, Any]) -> dict[str, float]:
     ip_buckets = state.get("ip_buckets", {})
     endpoint_buckets = state.get("endpoint_buckets", {})
     security_buckets = state.get("security_buckets", {})
+    identity_buckets = state.get("identity_buckets", {})
     unique_ips: set[str] = set()
     request_total = 0
     max_ip_rate = 0
     endpoint_peak = 0
     metrics: dict[str, float] = {}
+    credential_failures = 0.0
+    credential_targets = set()
     for second in range(now - SECURITY_WINDOW_SECONDS + 1, now + 1):
         second_key = str(second)
         request_total += int(request_buckets.get(second_key, 0))
@@ -219,6 +259,14 @@ def summarise_service_state(state: dict[str, Any]) -> dict[str, float]:
         if isinstance(security_counts, dict):
             for metric, value in security_counts.items():
                 metrics[metric] = float(metrics.get(metric, 0.0) + float(value))
+        identity_counts = identity_buckets.get(second_key, {})
+        if isinstance(identity_counts, dict):
+            for actor, outcomes in identity_counts.items():
+                if not isinstance(outcomes, dict):
+                    continue
+                credential_failures += float(outcomes.get("failed", 0.0))
+                if float(outcomes.get("failed", 0.0)) > 0:
+                    credential_targets.add(actor)
     connection_count = float(request_total)
     syn_flood_score = round(max_ip_rate / max(connection_count, 1.0), 4)
     metrics.update(
@@ -235,6 +283,17 @@ def summarise_service_state(state: dict[str, Any]) -> dict[str, float]:
             "clickjack_attempt_count": float(metrics.get("clickjack_attempt_count", 0.0)),
             "csrf_attempt_count": float(metrics.get("csrf_attempt_count", 0.0)),
             "blocked_attempt_count": float(metrics.get("blocked_attempt_count", 0.0)),
+            "session_hijack_attempt_count": float(metrics.get("session_hijack_attempt_count", 0.0)),
+            "credential_stuffing_attempt_count": float(metrics.get("credential_stuffing_attempt_count", credential_failures)),
+            "sqli_attempt_count": float(metrics.get("sqli_attempt_count", 0.0)),
+            "tls_downgrade_attempt_count": float(metrics.get("tls_downgrade_attempt_count", 0.0)),
+            "dns_spoof_attempt_count": float(metrics.get("dns_spoof_attempt_count", 0.0)),
+            "arp_spoof_attempt_count": float(metrics.get("arp_spoof_attempt_count", 0.0)),
+            "rogue_wifi_attempt_count": float(metrics.get("rogue_wifi_attempt_count", 0.0)),
+            "aitm_phishing_attempt_count": float(metrics.get("aitm_phishing_attempt_count", 0.0)),
+            "supply_chain_risk_count": float(metrics.get("supply_chain_risk_count", 0.0)),
+            "zero_day_signal_count": float(metrics.get("zero_day_signal_count", 0.0)),
+            "credential_target_count": float(len(credential_targets)),
         }
     )
     metrics["active_mitigations"] = float(len(get_controls(state.get("service_name", ""))) if state.get("service_name") else len(state.get("controls", {})))
@@ -290,3 +349,7 @@ def suspicious_embedding_request(headers: dict[str, str], allowed_hosts: list[st
 
 def payload_has_xss(payload: str) -> bool:
     return any(pattern.search(payload) for pattern in XSS_PATTERNS)
+
+
+def payload_has_sqli(payload: str) -> bool:
+    return any(pattern.search(payload) for pattern in SQLI_PATTERNS)

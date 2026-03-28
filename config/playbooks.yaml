@@ -36,3 +36,18 @@ playbooks:
   csrf_attack:
     - action: lockdown_mutations
       target: "{target}"
+  session_hijacking_attack:
+    - action: quarantine_sessions
+      target: "{target}"
+  credential_stuffing_attack:
+    - action: throttle_authentication
+      target: "{target}"
+  sqli_attack:
+    - action: enable_sql_guard
+      target: "{target}"
+  supply_chain_attack:
+    - action: isolate_third_party_egress
+      target: "{target}"
+  zero_day_attack:
+    - action: enable_emergency_patch_mode
+      target: "{target}"

@@ -46,6 +46,17 @@ QUERIES = {
     "blocked_attempt_count": 'sum(platform_security_blocked_attempt_total)',
     "request_rate_peak_per_endpoint": 'sum(platform_security_request_rate_peak_per_endpoint)',
     "active_mitigations": 'sum(platform_security_active_mitigations)',
+    "session_hijack_attempt_count": 'sum(platform_security_session_hijack_attempt_total)',
+    "credential_stuffing_attempt_count": 'sum(platform_security_credential_stuffing_attempt_total)',
+    "sqli_attempt_count": 'sum(platform_security_sqli_attempt_total)',
+    "tls_downgrade_attempt_count": 'sum(platform_security_tls_downgrade_attempt_total)',
+    "dns_spoof_attempt_count": 'sum(platform_security_dns_spoof_attempt_total)',
+    "arp_spoof_attempt_count": 'sum(platform_security_arp_spoof_attempt_total)',
+    "rogue_wifi_attempt_count": 'sum(platform_security_rogue_wifi_attempt_total)',
+    "aitm_phishing_attempt_count": 'sum(platform_security_aitm_attempt_total)',
+    "supply_chain_risk_count": 'sum(platform_security_supply_chain_risk_total)',
+    "zero_day_signal_count": 'sum(platform_security_zero_day_signal_total)',
+    "credential_target_count": 'sum(platform_security_credential_target_total)',
 }
 
 PER_SERVICE_QUERIES = {
@@ -68,6 +79,17 @@ PER_SERVICE_QUERIES = {
     "blocked_attempt_count": 'sum by (service) (platform_security_blocked_attempt_total)',
     "request_rate_peak_per_endpoint": 'sum by (service) (platform_security_request_rate_peak_per_endpoint)',
     "active_mitigations": 'sum by (service) (platform_security_active_mitigations)',
+    "session_hijack_attempt_count": 'sum by (service) (platform_security_session_hijack_attempt_total)',
+    "credential_stuffing_attempt_count": 'sum by (service) (platform_security_credential_stuffing_attempt_total)',
+    "sqli_attempt_count": 'sum by (service) (platform_security_sqli_attempt_total)',
+    "tls_downgrade_attempt_count": 'sum by (service) (platform_security_tls_downgrade_attempt_total)',
+    "dns_spoof_attempt_count": 'sum by (service) (platform_security_dns_spoof_attempt_total)',
+    "arp_spoof_attempt_count": 'sum by (service) (platform_security_arp_spoof_attempt_total)',
+    "rogue_wifi_attempt_count": 'sum by (service) (platform_security_rogue_wifi_attempt_total)',
+    "aitm_phishing_attempt_count": 'sum by (service) (platform_security_aitm_attempt_total)',
+    "supply_chain_risk_count": 'sum by (service) (platform_security_supply_chain_risk_total)',
+    "zero_day_signal_count": 'sum by (service) (platform_security_zero_day_signal_total)',
+    "credential_target_count": 'sum by (service) (platform_security_credential_target_total)',
 }
 
 SECURITY_SLO_DEFAULTS = {
@@ -76,6 +98,9 @@ SECURITY_SLO_DEFAULTS = {
     "csrf_attempt_rate_max": 0.0,
     "clickjack_attempt_rate_max": 0.0,
     "tls_handshake_failures_max": 0.0,
+    "credential_stuffing_attempt_rate_max": 0.0,
+    "sqli_attempt_rate_max": 0.0,
+    "session_hijack_attempt_rate_max": 0.0,
 }
 
 
@@ -190,6 +215,13 @@ def evaluate_slos(metrics: dict[str, dict[str, float]], slos: dict[str, dict[str
         tls_handshake_failures_max = float(
             targets.get("tls_handshake_failures_max", SECURITY_SLO_DEFAULTS["tls_handshake_failures_max"])
         )
+        credential_stuffing_attempt_rate_max = float(
+            targets.get("credential_stuffing_attempt_rate_max", SECURITY_SLO_DEFAULTS["credential_stuffing_attempt_rate_max"])
+        )
+        sqli_attempt_rate_max = float(targets.get("sqli_attempt_rate_max", SECURITY_SLO_DEFAULTS["sqli_attempt_rate_max"]))
+        session_hijack_attempt_rate_max = float(
+            targets.get("session_hijack_attempt_rate_max", SECURITY_SLO_DEFAULTS["session_hijack_attempt_rate_max"])
+        )
         latency_ok = observed.get("latency_p95", 0.0) <= latency_target
         error_ok = observed.get("error_rate", 0.0) <= error_target
         availability_ok = observed.get("availability", 1.0) >= availability_target
@@ -197,6 +229,9 @@ def evaluate_slos(metrics: dict[str, dict[str, float]], slos: dict[str, dict[str
         csrf_ok = observed.get("csrf_attempt_count", 0.0) <= csrf_attempt_rate_max
         clickjack_ok = observed.get("clickjack_attempt_count", 0.0) <= clickjack_attempt_rate_max
         tls_ok = observed.get("tls_handshake_failures", 0.0) <= tls_handshake_failures_max
+        credential_stuffing_ok = observed.get("credential_stuffing_attempt_count", 0.0) <= credential_stuffing_attempt_rate_max
+        sqli_ok = observed.get("sqli_attempt_count", 0.0) <= sqli_attempt_rate_max
+        session_hijack_ok = observed.get("session_hijack_attempt_count", 0.0) <= session_hijack_attempt_rate_max
         total_connections = max(observed.get("connection_count", 0.0), 1.0)
         ddos_block_rate = observed.get("blocked_attempt_count", 0.0) / total_connections if total_connections > 0 else 1.0
         ddos_ok = ddos_block_rate >= ddos_block_rate_min or observed.get("requests_per_ip_per_second", 0.0) == 0.0
@@ -208,6 +243,9 @@ def evaluate_slos(metrics: dict[str, dict[str, float]], slos: dict[str, dict[str
             ("csrf_attempt_count", csrf_ok),
             ("clickjack_attempt_count", clickjack_ok),
             ("tls_handshake_failures", tls_ok),
+            ("credential_stuffing_attempt_count", credential_stuffing_ok),
+            ("sqli_attempt_count", sqli_ok),
+            ("session_hijack_attempt_count", session_hijack_ok),
             ("ddos_block_rate", ddos_ok),
         ]
         passed = sum(1 for _, ok in checks if ok)
@@ -222,6 +260,11 @@ def evaluate_slos(metrics: dict[str, dict[str, float]], slos: dict[str, dict[str
                 observed.get("csrf_attempt_count", 0.0) / max(csrf_attempt_rate_max + 0.0001, 0.0001),
                 observed.get("clickjack_attempt_count", 0.0) / max(clickjack_attempt_rate_max + 0.0001, 0.0001),
                 observed.get("tls_handshake_failures", 0.0) / max(tls_handshake_failures_max + 0.0001, 0.0001),
+                observed.get("credential_stuffing_attempt_count", 0.0)
+                / max(credential_stuffing_attempt_rate_max + 0.0001, 0.0001),
+                observed.get("sqli_attempt_count", 0.0) / max(sqli_attempt_rate_max + 0.0001, 0.0001),
+                observed.get("session_hijack_attempt_count", 0.0)
+                / max(session_hijack_attempt_rate_max + 0.0001, 0.0001),
                 ddos_block_rate_min / max(ddos_block_rate, 0.0001),
             ),
             3,
@@ -242,6 +285,9 @@ def evaluate_slos(metrics: dict[str, dict[str, float]], slos: dict[str, dict[str
                         "csrf_attempt_rate_max": csrf_attempt_rate_max,
                         "clickjack_attempt_rate_max": clickjack_attempt_rate_max,
                         "tls_handshake_failures_max": tls_handshake_failures_max,
+                        "credential_stuffing_attempt_rate_max": credential_stuffing_attempt_rate_max,
+                        "sqli_attempt_rate_max": sqli_attempt_rate_max,
+                        "session_hijack_attempt_rate_max": session_hijack_attempt_rate_max,
                     },
                 "observed": {**observed, "ddos_block_rate": round(ddos_block_rate, 4)},
             }

@@ -36,6 +36,17 @@ class ApiGatewaySecurityTests(unittest.TestCase):
 
         self.assertEqual(MODULE.client_ip(request), "203.0.113.10")
 
+    def test_suspicious_transport_or_network_detects_tls_downgrade(self) -> None:
+        request = type(
+            "RequestStub",
+            (),
+            {"headers": {"x-forwarded-proto": "http", "host": "localhost"}, "client": type("ClientStub", (), {"host": "127.0.0.1"})()},
+        )()
+
+        findings = MODULE.suspicious_transport_or_network(request)
+
+        self.assertEqual(findings[0][1], "tls_downgrade_detected")
+
 
 if __name__ == "__main__":
     unittest.main()

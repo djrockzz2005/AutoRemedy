@@ -150,6 +150,14 @@ class DecisionEngineTests(unittest.IsolatedAsyncioTestCase):
     def test_default_target_for_security_classifications(self) -> None:
         self.assertEqual(MODULE.default_target_for("mitm_attack"), "api-gateway")
         self.assertEqual(MODULE.default_target_for("clickjacking_attack"), "dashboard")
+        self.assertEqual(MODULE.default_target_for("credential_stuffing_attack"), "dashboard")
+
+    def test_plan_actions_for_session_hijacking_and_sqli(self) -> None:
+        session_actions = MODULE.plan_actions({"classification": "session_hijacking_attack", "per_service": {"services": {"dashboard": {"session_hijack_attempt_count": 1}}}, "sample": {}})
+        sqli_actions = MODULE.plan_actions({"classification": "sqli_attack", "per_service": {"services": {"api-gateway": {"sqli_attempt_count": 1}}}, "sample": {}})
+
+        self.assertEqual(session_actions, [{"action": "quarantine_sessions", "target": "dashboard"}])
+        self.assertEqual(sqli_actions, [{"action": "enable_sql_guard", "target": "api-gateway"}])
 
     def test_cooldown_suppresses_repeat_target(self) -> None:
         MODULE.last_recovery_at[("latency_spike", "api-gateway")] = MODULE.time.time()
