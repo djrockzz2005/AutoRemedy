@@ -32,6 +32,8 @@ CLASSIFIER_MIN_SAMPLES = int(os.getenv("CLASSIFIER_MIN_SAMPLES", "30"))
 MODEL_PATH = Path(os.getenv("MODEL_PATH", "/tmp/model.pkl"))
 CLASSIFIER_MODEL_PATH = Path(os.getenv("CLASSIFIER_MODEL_PATH", "/tmp/classifier.pkl"))
 BASELINE_STATS_PATH = Path(os.getenv("BASELINE_STATS_PATH", "/tmp/model-baseline.json"))
+MIN_ACTIVE_REQUEST_RATE = float(os.getenv("MIN_ACTIVE_REQUEST_RATE", "0.02"))
+MIN_ACTIVE_LATENCY = float(os.getenv("MIN_ACTIVE_LATENCY", "0.02"))
 
 feature_window: deque[dict] = deque(maxlen=WINDOW)
 scores: deque[dict] = deque(maxlen=200)
@@ -205,6 +207,18 @@ def current_drift_score() -> float:
     return round(math.sqrt(sum((current_mean[idx] - baseline_mean[idx]) ** 2 for idx in range(len(FEATURE_KEYS)))), 4)
 
 
+def low_signal_sample(sample: dict) -> bool:
+    if sample.get("collector_error"):
+        return True
+    return (
+        float(sample.get("request_rate", 0.0)) <= MIN_ACTIVE_REQUEST_RATE
+        and float(sample.get("error_rate", 0.0)) <= 0.0
+        and float(sample.get("latency_p95", 0.0)) <= MIN_ACTIVE_LATENCY
+        and float(sample.get("restarts", 0.0)) <= 0.0
+        and float(sample.get("loki_errors", 0.0)) <= 0.0
+    )
+
+
 async def detect_loop() -> None:
     global last_event_ts
     while True:
@@ -232,7 +246,9 @@ async def detect_loop() -> None:
             service_feature_window.append(item)
         if should_retrain(len(service_feature_window), last_service_model_train_size, 20):
             train_service_isolation_model()
-        if isolation_model is not None and len(feature_window) >= 20:
+        if low_signal_sample(sample):
+            anomaly_score = 0.0
+        elif isolation_model is not None and len(feature_window) >= 20:
             decision = isolation_model.decision_function(np.array([vector]))[0]
             anomaly_score = 1 / (1 + math.exp(decision * 3))
         else:

@@ -129,6 +129,29 @@ def install_test_stubs() -> None:
     maintenance = _module("services.shared.maintenance", prune_tables=lambda *args, **kwargs: None)
     sys.modules["services.shared.maintenance"] = maintenance
 
+    class DummyConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def cursor(self):
+            return self
+
+        def execute(self, *args, **kwargs):
+            return None
+
+        def fetchone(self):
+            return None
+
+    store = _module(
+        "services.shared.store",
+        ensure_table=lambda *args, **kwargs: None,
+        pg_conn=lambda *args, **kwargs: DummyConnection(),
+    )
+    sys.modules["services.shared.store"] = store
+
     fastapi = _module(
         "fastapi",
         FastAPI=FakeFastAPI,

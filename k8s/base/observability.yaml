@@ -258,13 +258,13 @@ data:
   dashboards.yaml: |
     apiVersion: 1
     providers:
-      - name: chaos-loop
+      - name: autoremedy
         type: file
         options:
           path: /var/lib/grafana/dashboards
-  chaos-loop.json: |
+  autoremedy.json: |
     {
-      "title": "Chaos Loop Overview",
+      "title": "AutoRemedy Overview",
       "schemaVersion": 38,
       "version": 1,
       "panels": [
@@ -272,32 +272,72 @@ data:
           "type": "timeseries",
           "title": "Latency p95",
           "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Prometheus"
+          },
           "targets": [{ "expr": "histogram_quantile(0.95, sum(rate(platform_http_request_duration_seconds_bucket[5m])) by (le))" }]
         },
         {
           "type": "timeseries",
           "title": "Error Rate",
           "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Prometheus"
+          },
           "targets": [{ "expr": "sum(rate(platform_http_requests_total{status=~\"5..\"}[1m]))" }]
         },
         {
           "type": "stat",
           "title": "Trace Export Endpoint",
           "gridPos": { "h": 4, "w": 12, "x": 0, "y": 8 },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Prometheus"
+          },
           "options": { "textMode": "value" },
           "targets": [{ "expr": "1" }],
           "fieldConfig": { "defaults": { "mappings": [{ "type": "value", "options": { "1": { "text": "tempo:4318" } } }] } }
         },
         {
+          "type": "stat",
+          "title": "Prometheus Jobs",
+          "gridPos": { "h": 4, "w": 12, "x": 12, "y": 8 },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Prometheus"
+          },
+          "options": {
+            "textMode": "name",
+            "reduceOptions": {
+              "values": false,
+              "calcs": ["lastNotNull"],
+              "fields": ""
+            },
+            "orientation": "horizontal"
+          },
+          "targets": [{ "expr": "count by (job) (up)" }],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none"
+            }
+          }
+        },
+        {
           "type": "timeseries",
           "title": "SLO Burn Rate",
-          "gridPos": { "h": 4, "w": 12, "x": 12, "y": 8 },
+          "gridPos": { "h": 4, "w": 24, "x": 0, "y": 12 },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Prometheus"
+          },
           "targets": [{ "expr": "sum(rate(platform_http_requests_total{status=~\"5..\"}[5m])) / clamp_min(sum(rate(platform_http_requests_total[5m])), 0.0001)" }]
         },
         {
           "type": "logs",
           "title": "Trace-Correlated Errors",
-          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 12 },
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
           "datasource": {
             "type": "loki",
             "uid": "Loki"
@@ -344,8 +384,8 @@ spec:
               mountPath: /etc/grafana/provisioning/dashboards/dashboards.yaml
               subPath: dashboards.yaml
             - name: provisioning
-              mountPath: /var/lib/grafana/dashboards/chaos-loop.json
-              subPath: chaos-loop.json
+              mountPath: /var/lib/grafana/dashboards/autoremedy.json
+              subPath: autoremedy.json
       volumes:
         - name: provisioning
           configMap:

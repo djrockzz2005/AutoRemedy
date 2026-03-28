@@ -1,4 +1,6 @@
-# Autonomous Chaos Engineering and Self-Healing Platform
+# AutoRemedy
+
+Autonomous Chaos Engineering and Self-Healing Platform
 
 This repository deploys a production-style microservice application on Kubernetes and wraps it with an autonomous control loop:
 
