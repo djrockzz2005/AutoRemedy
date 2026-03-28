@@ -59,6 +59,19 @@ FEATURE_KEYS = [
     "memory",
     "loki_errors",
     "availability",
+    "requests_per_ip_per_second",
+    "unique_source_ips",
+    "connection_count",
+    "syn_flood_score",
+    "tls_handshake_failures",
+    "certificate_mismatch_count",
+    "unexpected_certificate_fingerprints",
+    "xss_attempt_count",
+    "clickjack_attempt_count",
+    "csrf_attempt_count",
+    "blocked_attempt_count",
+    "request_rate_peak_per_endpoint",
+    "active_mitigations",
 ]
 
 
@@ -67,6 +80,30 @@ def build_vector(sample: dict) -> list[float]:
 
 
 def rule_based_classify(sample: dict) -> str:
+    request_rate = float(sample.get("request_rate", 0.0))
+    single_ip_rate = float(sample.get("requests_per_ip_per_second", 0.0))
+    unique_ips = float(sample.get("unique_source_ips", 0.0))
+    total_connections = float(sample.get("connection_count", 0.0))
+    unique_ip_ratio = unique_ips / max(total_connections, 1.0)
+    if (
+        single_ip_rate >= float(os.getenv("DDOS_ATTACK_IP_RATE_THRESHOLD", "25"))
+        or total_connections >= float(os.getenv("DDOS_CONNECTION_COUNT_THRESHOLD", "150"))
+        or sample.get("syn_flood_score", 0.0) >= float(os.getenv("DDOS_SYN_FLOOD_SCORE_THRESHOLD", "0.4"))
+        or (request_rate > 0 and unique_ip_ratio >= float(os.getenv("DDOS_UNIQUE_IP_RATIO_THRESHOLD", "0.65")))
+    ):
+        return "ddos_attack"
+    if (
+        float(sample.get("tls_handshake_failures", 0.0)) > 0.0
+        or float(sample.get("certificate_mismatch_count", 0.0)) > 0.0
+        or float(sample.get("unexpected_certificate_fingerprints", 0.0)) > 0.0
+    ):
+        return "mitm_attack"
+    if float(sample.get("xss_attempt_count", 0.0)) >= float(os.getenv("XSS_ATTACK_THRESHOLD", "1")):
+        return "xss_attack"
+    if float(sample.get("clickjack_attempt_count", 0.0)) >= float(os.getenv("CLICKJACK_ATTACK_THRESHOLD", "1")):
+        return "clickjacking_attack"
+    if float(sample.get("csrf_attempt_count", 0.0)) >= float(os.getenv("CSRF_ATTACK_THRESHOLD", "1")):
+        return "csrf_attack"
     if sample.get("error_rate", 0) > 0.5 or sample.get("availability", 1) < 0.9:
         return "availability_regression"
     if sample.get("latency_p95", 0) > 1.2:
@@ -170,6 +207,19 @@ def annotate_per_service(sample: dict) -> dict[str, Any]:
         "top_error_services": ranked["error_rate"],
         "lowest_availability_services": ranked["availability"],
         "top_loki_error_services": ranked["loki_errors"],
+        "top_ddos_services": sorted(
+            per_service.items(),
+            key=lambda item: item[1].get("requests_per_ip_per_second", 0.0) + item[1].get("syn_flood_score", 0.0),
+            reverse=True,
+        )[:3],
+        "top_security_services": sorted(
+            per_service.items(),
+            key=lambda item: item[1].get("xss_attempt_count", 0.0)
+            + item[1].get("csrf_attempt_count", 0.0)
+            + item[1].get("clickjack_attempt_count", 0.0)
+            + item[1].get("tls_handshake_failures", 0.0),
+            reverse=True,
+        )[:3],
     }
 
 
@@ -216,6 +266,11 @@ def low_signal_sample(sample: dict) -> bool:
         and float(sample.get("latency_p95", 0.0)) <= MIN_ACTIVE_LATENCY
         and float(sample.get("restarts", 0.0)) <= 0.0
         and float(sample.get("loki_errors", 0.0)) <= 0.0
+        and float(sample.get("xss_attempt_count", 0.0)) <= 0.0
+        and float(sample.get("csrf_attempt_count", 0.0)) <= 0.0
+        and float(sample.get("clickjack_attempt_count", 0.0)) <= 0.0
+        and float(sample.get("tls_handshake_failures", 0.0)) <= 0.0
+        and float(sample.get("requests_per_ip_per_second", 0.0)) <= 0.0
     )
 
 

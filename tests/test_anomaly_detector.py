@@ -57,7 +57,8 @@ class AnomalyDetectorTests(unittest.IsolatedAsyncioTestCase):
 
     def test_build_vector_uses_feature_order_and_zero_defaults(self) -> None:
         vector = MODULE.build_vector({"request_rate": "7", "memory": 12})
-        self.assertEqual(vector, [7.0, 0.0, 0.0, 0.0, 0.0, 12.0, 0.0, 0.0])
+        self.assertEqual(vector[:8], [7.0, 0.0, 0.0, 0.0, 0.0, 12.0, 0.0, 0.0])
+        self.assertEqual(len(vector), len(MODULE.FEATURE_KEYS))
 
     def test_classify_prefers_trained_classifier_after_warmup(self) -> None:
         MODULE.classifier_model = StubClassifier("learned_label")
@@ -86,6 +87,23 @@ class AnomalyDetectorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([item["service"] for item in vectors], ["payment-service", "api-gateway"])
         self.assertEqual(vectors[0]["vector"][1], 0.3)
+
+    def test_rule_based_classify_detects_ddos(self) -> None:
+        classification = MODULE.rule_based_classify(
+            {
+                "request_rate": 3.0,
+                "requests_per_ip_per_second": 30.0,
+                "unique_source_ips": 80.0,
+                "connection_count": 100.0,
+                "syn_flood_score": 0.5,
+            }
+        )
+        self.assertEqual(classification, "ddos_attack")
+
+    def test_rule_based_classify_detects_web_attacks(self) -> None:
+        self.assertEqual(MODULE.rule_based_classify({"xss_attempt_count": 2}), "xss_attack")
+        self.assertEqual(MODULE.rule_based_classify({"clickjack_attempt_count": 1}), "clickjacking_attack")
+        self.assertEqual(MODULE.rule_based_classify({"csrf_attempt_count": 1}), "csrf_attack")
 
     async def test_detect_loop_records_event_from_mocked_telemetry(self) -> None:
         sample = {

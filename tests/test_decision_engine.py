@@ -134,6 +134,23 @@ class DecisionEngineTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    def test_plan_actions_ddos_attack_applies_rate_limit_and_scaling(self) -> None:
+        event = {
+            "classification": "ddos_attack",
+            "per_service": {"services": {"api-gateway": {"requests_per_ip_per_second": 40, "connection_count": 200}}},
+            "sample": {},
+        }
+
+        actions = MODULE.plan_actions(event)
+
+        self.assertEqual(actions[0]["action"], "apply_rate_limit")
+        self.assertEqual(actions[0]["target"], "api-gateway")
+        self.assertEqual(actions[1]["action"], "scale_under_ddos")
+
+    def test_default_target_for_security_classifications(self) -> None:
+        self.assertEqual(MODULE.default_target_for("mitm_attack"), "api-gateway")
+        self.assertEqual(MODULE.default_target_for("clickjacking_attack"), "dashboard")
+
     def test_cooldown_suppresses_repeat_target(self) -> None:
         MODULE.last_recovery_at[("latency_spike", "api-gateway")] = MODULE.time.time()
 

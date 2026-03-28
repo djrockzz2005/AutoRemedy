@@ -26,6 +26,7 @@ This repository deploys a production-style microservice application on Kubernete
 - Resource pressure via Kubernetes `Job`
 - Network partitions via `NetworkPolicy`
 - Latency injection via deployment patch and rolling restart
+- Cyber attack drills for DDoS, MITM, XSS, clickjacking, and CSRF
 
 ## Recovery actions
 
@@ -35,6 +36,9 @@ This repository deploys a production-style microservice application on Kubernete
 - Cache restore and warmup
 - Network policy rollback
 - Latency reset
+- DDoS rate limiting and burst scaling
+- mTLS enforcement and certificate rotation
+- WAF tightening, frame-policy enforcement, and mutation lockdown
 
 ## Quick start
 
@@ -60,6 +64,7 @@ The bootstrap script downloads `kind` and `kubectl` into `.bin/`. The deploy pat
 - `GET /slo/status`: per-service SLO compliance, active violations, and burn-rate estimate
 
 Each telemetry sample now includes a `per_service` object so the anomaly detector and decision engine can attribute failures to the most degraded workload.
+Security telemetry is also merged into the same samples, including `requests_per_ip_per_second`, `unique_source_ips`, `connection_count`, `syn_flood_score`, `tls_handshake_failures`, `certificate_mismatch_count`, `xss_attempt_count`, `clickjack_attempt_count`, `csrf_attempt_count`, and `blocked_attempt_count`.
 
 ## Dynamic Attribution And Cooldowns
 
@@ -85,6 +90,14 @@ Each telemetry sample now includes a `per_service` object so the anomaly detecto
 - Remediation actions can now be overridden without code changes through `config/playbooks.yaml`.
 - `PLAYBOOK_PATH` points to the YAML file to load. Default: `/app/config/playbooks.yaml`.
 - Playbook templates can interpolate `{target}` and `{classification}` into action payloads.
+- Default playbooks now cover `ddos_attack`, `mitm_attack`, `xss_attack`, `clickjacking_attack`, and `csrf_attack`.
+
+## Security Loop
+
+- `api-gateway` now applies per-IP sliding-window rate limiting, proxy-chain validation, XSS request inspection, always-on anti-clickjacking headers, and audit/notification hooks.
+- `dashboard` now emits clickjacking and CSRF telemetry, serves strict security headers, and requires CSRF tokens on state-changing authenticated requests.
+- `recovery-engine` can apply temporary security posture changes and automatically relax them once telemetry indicates the attack has subsided.
+- `chaos-engine` exposes `ddos-simulation`, `mitm-simulation`, `xss-probe`, `clickjacking-probe`, and `csrf-probe` scenarios for closed-loop validation.
 
 ## Alerting And Audit
 
@@ -180,6 +193,15 @@ Each telemetry sample now includes a `per_service` object so the anomaly detecto
 - `DASHBOARD_ADMIN_ROLE`: role claim granting chaos access. Default: `admin`
 - `PLATFORM_RETENTION_DAYS`: audit/history/notification retention window. Default used by maintenance scripts and dashboard startup: `14`
 - `TARGET_NAMESPACES`: namespaces monitored by the operator console and control plane. Default: `chaos-loop`
+- `DDOS_RATE_LIMIT_PER_IP`: gateway requests-per-second limit before returning `429`. Default: `20`
+- `DDOS_ATTACK_IP_RATE_THRESHOLD`: anomaly rule threshold for classifying DDoS. Default: `25`
+- `DDOS_CONNECTION_COUNT_THRESHOLD`: anomaly rule threshold for volumetric traffic. Default: `150`
+- `DDOS_UNIQUE_IP_RATIO_THRESHOLD`: anomaly rule threshold for distributed-source spikes. Default: `0.65`
+- `DDOS_SYN_FLOOD_SCORE_THRESHOLD`: anomaly rule threshold for SYN-flood style traffic. Default: `0.4`
+- `XSS_PATTERN_STRICTNESS`: gateway inspection mode. Default: `strict`
+- `CSRF_TOKEN_TTL_SECONDS`: dashboard CSRF token lifetime. Default: `1800`
+- `SECURITY_WINDOW_SECONDS`: shared security telemetry rolling window. Default: `60`
+- `SECURITY_POSTURE_COOLDOWN_SECONDS`: minimum hold time before auto-relaxing temporary mitigations. Default: `90`
 
 ## Operations
 

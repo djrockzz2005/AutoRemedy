@@ -14,6 +14,7 @@ from services.shared.audit import audit_event
 from services.shared.history import record_history, recent_history
 from services.shared.notifications import notification_worker, notify
 from services.shared.observability import install_observability, observe_event, traced_post
+from services.shared.security import set_control
 
 app = FastAPI(title="recovery-engine")
 logger = install_observability(app, "recovery-engine")
@@ -23,6 +24,9 @@ DEFAULT_TARGET_NAMESPACES = [
     item.strip() for item in os.getenv("TARGET_NAMESPACES", NAMESPACE).split(",") if item.strip()
 ]
 INVENTORY_URL = os.getenv("INVENTORY_URL", "http://inventory-service:8000")
+TELEMETRY_URL = os.getenv("TELEMETRY_URL", "http://telemetry-bridge:8000")
+AUTO_RELAX_SECONDS = int(os.getenv("SECURITY_POSTURE_COOLDOWN_SECONDS", "90"))
+active_mitigations: list[dict[str, Any]] = []
 
 
 def load_k8s() -> tuple[client.AppsV1Api, client.CoreV1Api, client.NetworkingV1Api]:
@@ -42,6 +46,7 @@ class RecoveryRequest(BaseModel):
     service_name: str | None = None
     selector_value: str | None = None
     reason: str | None = None
+    ip_ranges: list[str] | None = None
 
 
 def add_timeline(entry: dict) -> None:
@@ -69,6 +74,71 @@ def patch_env(containers: list[client.V1Container], container_name: str | None, 
         env.append({"name": env_name, "value": env_value})
         patches.append({"name": container.name, "env": env})
     return patches
+
+
+def remember_mitigation(entry: dict[str, Any]) -> None:
+    active_mitigations.append(entry)
+    del active_mitigations[:-100]
+
+
+def find_mitigation(action: str, target: str | None, namespace: str) -> dict[str, Any] | None:
+    for item in reversed(active_mitigations):
+        if item.get("action") == action and item.get("target") == target and item.get("namespace") == namespace and item.get("active", True):
+            return item
+    return None
+
+
+async def current_security_snapshot() -> dict[str, Any]:
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as client_http:
+            response = await client_http.get(f"{TELEMETRY_URL}/features/latest")
+            response.raise_for_status()
+            return response.json()
+    except Exception:
+        return {}
+
+
+def security_signal_cleared(reason: str, sample: dict[str, Any], target: str | None) -> bool:
+    service_sample = ((sample.get("per_service") or {}).get(target or "", {}) if isinstance(sample.get("per_service"), dict) else {}) or sample
+    if reason == "ddos_attack":
+        return service_sample.get("requests_per_ip_per_second", 0.0) < 3 and service_sample.get("syn_flood_score", 0.0) < 0.1
+    if reason == "mitm_attack":
+        return (
+            service_sample.get("tls_handshake_failures", 0.0) <= 0.0
+            and service_sample.get("certificate_mismatch_count", 0.0) <= 0.0
+            and service_sample.get("unexpected_certificate_fingerprints", 0.0) <= 0.0
+        )
+    if reason == "xss_attack":
+        return service_sample.get("xss_attempt_count", 0.0) <= 0.0
+    if reason == "csrf_attack":
+        return service_sample.get("csrf_attempt_count", 0.0) <= 0.0
+    return False
+
+
+async def relax_security_posture_loop() -> None:
+    while True:
+        snapshot = await current_security_snapshot()
+        now = datetime.now(timezone.utc).timestamp()
+        for mitigation in list(active_mitigations):
+            if not mitigation.get("active", True):
+                continue
+            if (now - mitigation.get("activated_at", now)) < AUTO_RELAX_SECONDS:
+                continue
+            if not security_signal_cleared(mitigation.get("reason", ""), snapshot, mitigation.get("target")):
+                continue
+            request = RecoveryRequest(
+                action=mitigation["rollback_action"],
+                target=mitigation.get("target"),
+                namespace=mitigation.get("namespace"),
+                replicas=mitigation.get("baseline_replicas"),
+                reason=f"{mitigation.get('reason', 'security_event')}_recovered",
+            )
+            try:
+                await recover(request)
+                mitigation["active"] = False
+            except Exception:
+                logger.warning("Automatic posture relaxation failed", extra=mitigation)
+        await asyncio.sleep(5)
 
 
 @app.post("/recover")
@@ -128,6 +198,183 @@ async def recover(request: RecoveryRequest) -> dict:
                 raise HTTPException(status_code=404, detail="container_not_found")
             patch = {"spec": {"template": {"spec": {"containers": containers}}}}
             apps_api.patch_namespaced_deployment(request.target, namespace, patch)
+        elif request.action == "apply_rate_limit":
+            if not request.target:
+                raise HTTPException(status_code=400, detail="target_required")
+            ip_ranges = request.ip_ranges or [os.getenv("DDOS_BLOCK_CIDR", "0.0.0.0/0")]
+            ingress_rules = []
+            for cidr in ip_ranges:
+                ingress_rules.append(client.V1NetworkPolicyIngressRule(_from=[client.V1IPBlock(cidr=cidr, except_=["10.0.0.0/8"])]))
+            policy = client.V1NetworkPolicy(
+                metadata=client.V1ObjectMeta(name=f"{request.target}-ddos-guard"),
+                spec=client.V1NetworkPolicySpec(
+                    pod_selector=client.V1LabelSelector(match_labels={"app": request.target}),
+                    ingress=ingress_rules,
+                    policy_types=["Ingress"],
+                ),
+            )
+            try:
+                net_api.replace_namespaced_network_policy(f"{request.target}-ddos-guard", namespace, policy)
+            except Exception:
+                net_api.create_namespaced_network_policy(namespace, policy)
+            set_control(request.target, "rate_limit", True, metadata={"ip_ranges": ip_ranges})
+            remember_mitigation(
+                {
+                    "action": request.action,
+                    "rollback_action": "remove_rate_limit",
+                    "target": request.target,
+                    "namespace": namespace,
+                    "reason": request.reason,
+                    "activated_at": datetime.now(timezone.utc).timestamp(),
+                    "active": True,
+                }
+            )
+        elif request.action == "remove_rate_limit":
+            if not request.target:
+                raise HTTPException(status_code=400, detail="target_required")
+            net_api.delete_namespaced_network_policy(f"{request.target}-ddos-guard", namespace)
+            set_control(request.target, "rate_limit", False)
+        elif request.action == "scale_under_ddos":
+            if not request.target:
+                raise HTTPException(status_code=400, detail="target_required")
+            deployment = apps_api.read_namespaced_deployment(request.target, namespace)
+            baseline = deployment.spec.replicas or 1
+            patch = {
+                "metadata": {"annotations": {"autoremedy.io/hpa-burst-mode": "enabled"}},
+                "spec": {"replicas": request.replicas or max(4, baseline * 2)},
+            }
+            apps_api.patch_namespaced_deployment(request.target, namespace, patch)
+            set_control(request.target, "ddos_burst_mode", True)
+            remember_mitigation(
+                {
+                    "action": request.action,
+                    "rollback_action": "scale_deployment",
+                    "target": request.target,
+                    "namespace": namespace,
+                    "reason": request.reason,
+                    "activated_at": datetime.now(timezone.utc).timestamp(),
+                    "baseline_replicas": baseline,
+                    "active": True,
+                }
+            )
+        elif request.action == "enforce_mtls":
+            if not request.target:
+                raise HTTPException(status_code=400, detail="target_required")
+            policy = client.V1NetworkPolicy(
+                metadata=client.V1ObjectMeta(name=f"{request.target}-strict-mtls"),
+                spec=client.V1NetworkPolicySpec(
+                    pod_selector=client.V1LabelSelector(match_labels={"app": request.target}),
+                    ingress=[
+                        client.V1NetworkPolicyIngressRule(
+                            _from=[client.V1NetworkPolicyPeer(namespace_selector=client.V1LabelSelector(match_labels={"kubernetes.io/metadata.name": namespace}))]
+                        )
+                    ],
+                    policy_types=["Ingress"],
+                ),
+            )
+            try:
+                net_api.replace_namespaced_network_policy(f"{request.target}-strict-mtls", namespace, policy)
+            except Exception:
+                net_api.create_namespaced_network_policy(namespace, policy)
+            set_control(request.target, "strict_mtls", True)
+            remember_mitigation(
+                {
+                    "action": request.action,
+                    "rollback_action": "relax_mtls",
+                    "target": request.target,
+                    "namespace": namespace,
+                    "reason": request.reason,
+                    "activated_at": datetime.now(timezone.utc).timestamp(),
+                    "active": True,
+                }
+            )
+        elif request.action == "relax_mtls":
+            if not request.target:
+                raise HTTPException(status_code=400, detail="target_required")
+            net_api.delete_namespaced_network_policy(f"{request.target}-strict-mtls", namespace)
+            set_control(request.target, "strict_mtls", False)
+        elif request.action == "rotate_certificates":
+            if not request.target:
+                raise HTTPException(status_code=400, detail="target_required")
+            patch = {
+                "spec": {
+                    "template": {
+                        "metadata": {
+                            "annotations": {"autoremedy.io/cert-rotated-at": datetime.now(timezone.utc).isoformat()}
+                        }
+                    }
+                }
+            }
+            apps_api.patch_namespaced_deployment(request.target, namespace, patch)
+        elif request.action == "enable_waf_rules":
+            if not request.target:
+                raise HTTPException(status_code=400, detail="target_required")
+            deployment = apps_api.read_namespaced_deployment(request.target, namespace)
+            containers = patch_env(deployment.spec.template.spec.containers, request.container_name, "XSS_PROTECTION_MODE", "strict")
+            patch = {"spec": {"template": {"spec": {"containers": containers}}}}
+            apps_api.patch_namespaced_deployment(request.target, namespace, patch)
+            set_control(request.target, "waf_strict", True)
+            remember_mitigation(
+                {
+                    "action": request.action,
+                    "rollback_action": "disable_waf_rules",
+                    "target": request.target,
+                    "namespace": namespace,
+                    "reason": request.reason,
+                    "activated_at": datetime.now(timezone.utc).timestamp(),
+                    "active": True,
+                }
+            )
+        elif request.action == "disable_waf_rules":
+            if not request.target:
+                raise HTTPException(status_code=400, detail="target_required")
+            deployment = apps_api.read_namespaced_deployment(request.target, namespace)
+            containers = patch_env(deployment.spec.template.spec.containers, request.container_name, "XSS_PROTECTION_MODE", "normal")
+            patch = {"spec": {"template": {"spec": {"containers": containers}}}}
+            apps_api.patch_namespaced_deployment(request.target, namespace, patch)
+            set_control(request.target, "waf_strict", False)
+        elif request.action == "enforce_frame_policy":
+            if not request.target:
+                raise HTTPException(status_code=400, detail="target_required")
+            patch = {
+                "spec": {
+                    "template": {
+                        "metadata": {
+                            "annotations": {
+                                "nginx.ingress.kubernetes.io/configuration-snippet": "add_header X-Frame-Options DENY always; add_header Content-Security-Policy \"frame-ancestors 'none'\" always;"
+                            }
+                        }
+                    }
+                }
+            }
+            apps_api.patch_namespaced_deployment(request.target, namespace, patch)
+        elif request.action == "lockdown_mutations":
+            if not request.target:
+                raise HTTPException(status_code=400, detail="target_required")
+            deployment = apps_api.read_namespaced_deployment(request.target, namespace)
+            containers = patch_env(deployment.spec.template.spec.containers, request.container_name, "LOCKDOWN_MUTATIONS", "true")
+            patch = {"spec": {"template": {"spec": {"containers": containers}}}}
+            apps_api.patch_namespaced_deployment(request.target, namespace, patch)
+            set_control(request.target, "lockdown_mutations", True)
+            remember_mitigation(
+                {
+                    "action": request.action,
+                    "rollback_action": "unlock_mutations",
+                    "target": request.target,
+                    "namespace": namespace,
+                    "reason": request.reason,
+                    "activated_at": datetime.now(timezone.utc).timestamp(),
+                    "active": True,
+                }
+            )
+        elif request.action == "unlock_mutations":
+            if not request.target:
+                raise HTTPException(status_code=400, detail="target_required")
+            deployment = apps_api.read_namespaced_deployment(request.target, namespace)
+            containers = patch_env(deployment.spec.template.spec.containers, request.container_name, "LOCKDOWN_MUTATIONS", "false")
+            patch = {"spec": {"template": {"spec": {"containers": containers}}}}
+            apps_api.patch_namespaced_deployment(request.target, namespace, patch)
+            set_control(request.target, "lockdown_mutations", False)
         else:
             raise HTTPException(status_code=400, detail="unknown_action")
         observe_event("recovery-engine", "recovery_executed")
@@ -183,6 +430,7 @@ async def get_timeline() -> dict:
 @app.on_event("startup")
 async def startup() -> None:
     asyncio.create_task(notification_worker())
+    asyncio.create_task(relax_security_posture_loop())
 
 
 @app.get("/workloads")

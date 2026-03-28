@@ -16,3 +16,23 @@ playbooks:
   application_error_burst:
     - action: restart_deployment
       target: "{target}"
+  ddos_attack:
+    - action: apply_rate_limit
+      target: "{target}"
+    - action: scale_under_ddos
+      target: "{target}"
+      replicas: 6
+  mitm_attack:
+    - action: enforce_mtls
+      target: "{target}"
+    - action: rotate_certificates
+      target: "{target}"
+  xss_attack:
+    - action: enable_waf_rules
+      target: "{target}"
+  clickjacking_attack:
+    - action: enforce_frame_policy
+      target: "{target}"
+  csrf_attack:
+    - action: lockdown_mutations
+      target: "{target}"

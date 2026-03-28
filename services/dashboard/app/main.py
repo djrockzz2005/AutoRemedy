@@ -8,6 +8,7 @@ import json
 import os
 import secrets
 import socket
+import time
 from typing import Any
 from urllib.parse import urlencode
 
@@ -22,6 +23,7 @@ from services.shared.migrations import migrate
 from services.shared.maintenance import prune_tables
 from services.shared.notifications import notification_worker
 from services.shared.observability import install_observability, traced_get, traced_post
+from services.shared.security import get_controls, increment_security_metric, payload_has_xss, record_request, suspicious_embedding_request
 from services.shared.store import ensure_table, pg_conn
 
 app = FastAPI(title="dashboard")
@@ -42,6 +44,9 @@ SESSION_COOKIE_NAME = os.getenv("DASHBOARD_SESSION_COOKIE", "dashboard_session")
 SESSION_COOKIE_MAX_AGE = int(os.getenv("DASHBOARD_SESSION_MAX_AGE_SECONDS", "43200"))
 SESSION_SECRET = os.getenv("DASHBOARD_SESSION_SECRET", "autoremedy-dashboard-session-secret")
 AUTH_MIN_PASSWORD_LENGTH = int(os.getenv("DASHBOARD_MIN_PASSWORD_LENGTH", "8"))
+CSRF_COOKIE_NAME = os.getenv("DASHBOARD_CSRF_COOKIE", "dashboard_csrf")
+CSRF_TOKEN_TTL_SECONDS = int(os.getenv("CSRF_TOKEN_TTL_SECONDS", "1800"))
+ALLOWED_EMBED_HOSTS = [item.strip() for item in os.getenv("DASHBOARD_ALLOWED_HOSTS", "localhost,dashboard").split(",") if item.strip()]
 
 
 def dashboard_db():
@@ -106,12 +111,59 @@ def authenticated_username(request: Request) -> str | None:
     return username_from_session(request.cookies.get(SESSION_COOKIE_NAME))
 
 
+def csrf_token_value(username: str) -> str:
+    issued_at = str(int(time.time()))
+    nonce = secrets.token_urlsafe(16)
+    payload = f"{normalize_username(username)}:{issued_at}:{nonce}"
+    signature = hmac.new(SESSION_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}:{signature}"
+
+
+def csrf_token_for_request(request: Request) -> str | None:
+    return request.cookies.get(CSRF_COOKIE_NAME)
+
+
+def validate_csrf_token(request: Request, username: str | None) -> bool:
+    token = request.headers.get("x-csrf-token") or request.cookies.get(CSRF_COOKIE_NAME)
+    if not token or not username:
+        return False
+    try:
+        token_user, issued_at, nonce, signature = token.split(":", 3)
+    except ValueError:
+        return False
+    if normalize_username(token_user) != normalize_username(username):
+        return False
+    payload = f"{token_user}:{issued_at}:{nonce}"
+    expected = hmac.new(SESSION_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        return False
+    return (int(time.time()) - int(issued_at)) <= CSRF_TOKEN_TTL_SECONDS
+
+
+def apply_session_cookies(response: Response, username: str) -> None:
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        session_cookie_value(username),
+        max_age=SESSION_COOKIE_MAX_AGE,
+        httponly=True,
+        samesite="strict",
+    )
+    response.set_cookie(
+        CSRF_COOKIE_NAME,
+        csrf_token_value(username),
+        max_age=CSRF_TOKEN_TTL_SECONDS,
+        httponly=False,
+        samesite="strict",
+    )
+
+
 HTML = r"""
 <!doctype html>
 <html>
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="csrf-token" content="__CSRF_TOKEN__" />
     <title>AutoRemedy Operator Console</title>
     <style>
       :root { color-scheme: light; --bg:#edf2f7; --panel:#fcfdff; --panel-strong:#ffffff; --ink:#122033; --muted:#64748b; --line:rgba(15,23,42,.08); --line-strong:rgba(15,23,42,.14); --accent:#ff6b35; --accent-2:#ff9f45; --danger:#df3f54; --ok:#23967f; --warn:#f4a261; --glow:rgba(255,107,53,.18); --shadow:0 18px 40px rgba(15,23,42,.08); }
@@ -130,7 +182,7 @@ HTML = r"""
       html, body { overflow-x:hidden; }
       .hero, .top-grid, .main-grid, .bottom-grid { display:grid; gap:18px; }
       .hero { grid-template-columns: 1.2fr .8fr; margin-bottom:18px; }
-      .top-grid { grid-template-columns: repeat(5, 1fr); margin-bottom:18px; }
+      .top-grid { grid-template-columns: repeat(4, 1fr); margin-bottom:18px; }
       .main-grid { grid-template-columns: minmax(0, 1.2fr) minmax(0, .8fr); margin-bottom:18px; }
       .bottom-grid { grid-template-columns: 1fr 1fr; }
       .stack { display:grid; gap:18px; }
@@ -355,6 +407,9 @@ HTML = r"""
         <div class="card metric-card"><div class="metric-label">Recovery action</div><div id="recovery" class="kpi">none</div><div class="micro" id="recoveryMeta">Autonomous remediation idle</div></div>
         <div class="card metric-card"><div class="metric-label">Latency p95</div><div id="latency" class="kpi">0ms</div><div class="micro" id="latencyMeta">Live request path health</div></div>
         <div class="card metric-card"><div class="metric-label">SLO compliance</div><div id="sloCompliance" class="kpi">100%</div><div class="micro" id="sloMeta">Error budget healthy</div></div>
+        <div class="card metric-card"><div class="metric-label">Security posture</div><div id="securityStatus" class="kpi">Nominal</div><div class="micro" id="securityMeta">No active attack telemetry</div></div>
+        <div class="card metric-card"><div class="metric-label">Blocked attempts</div><div id="blockedAttempts" class="kpi">0</div><div class="micro" id="blockedMeta">Gateway and dashboard blocks</div></div>
+        <div class="card metric-card"><div class="metric-label">Mitigations</div><div id="activeMitigations" class="kpi">0</div><div class="micro" id="mitigationMeta">Temporary controls inactive</div></div>
       </section>
 
       <section class="main-grid">
@@ -568,6 +623,9 @@ HTML = r"""
       function showDashboard(session) {
         currentSession = session;
         document.getElementById('sessionUser').textContent = session.username;
+        if (session.csrf_token) {
+          document.querySelector('meta[name="csrf-token"]').setAttribute('content', session.csrf_token);
+        }
         document.getElementById('authShell').classList.add('hidden');
         document.getElementById('appShell').classList.remove('hidden');
         setAuthStatus('', '');
@@ -649,6 +707,17 @@ HTML = r"""
           : 'Autonomous remediation idle';
         document.getElementById('latencyMeta').textContent = `Availability ${(latestSample.availability || 1).toFixed(2)}`;
         document.getElementById('sloMeta').textContent = (sloStatus.items || []).some(item => !item.healthy) ? 'SLO violations active' : 'Error budget healthy';
+        const activeSecurityEvent = (data.events || []).slice().reverse().find(item => ['ddos_attack', 'mitm_attack', 'xss_attack', 'clickjacking_attack', 'csrf_attack'].includes(item.classification));
+        const blockedAttempts = Math.round(latestSample.blocked_attempt_count || 0);
+        const activeMitigations = Math.round(latestSample.active_mitigations || 0);
+        document.getElementById('securityStatus').textContent = activeSecurityEvent ? classificationLabel(activeSecurityEvent.classification) : 'Nominal';
+        document.getElementById('securityMeta').textContent = activeSecurityEvent
+          ? `Last seen ${activeSecurityEvent.ts.slice(11,19)}`
+          : 'No active attack telemetry';
+        document.getElementById('blockedAttempts').textContent = String(blockedAttempts);
+        document.getElementById('blockedMeta').textContent = `${Math.round(latestSample.xss_attempt_count || 0)} XSS, ${Math.round(latestSample.csrf_attempt_count || 0)} CSRF`;
+        document.getElementById('activeMitigations').textContent = String(activeMitigations);
+        document.getElementById('mitigationMeta').textContent = activeMitigations > 0 ? 'Temporary controls active' : 'Temporary controls inactive';
         document.getElementById('sampleTime').textContent = latest ? latest.ts.slice(11,19) : '--:--:--';
         document.getElementById('windowSize').textContent = String(scores.length);
         document.getElementById('signalState').textContent = latest && latest.score >= 0.58 ? 'Active incident' : 'Nominal';
@@ -754,8 +823,12 @@ HTML = r"""
         };
       }
 
+      function currentCsrfToken() {
+        return document.querySelector('meta[name="csrf-token"]').getAttribute('content') || '';
+      }
+
       function authHeaders() {
-        return {'Content-Type':'application/json'};
+        return {'Content-Type':'application/json', 'X-CSRF-Token': currentCsrfToken()};
       }
 
       async function bootstrapDashboard() {
@@ -1026,8 +1099,10 @@ def docker_containers() -> dict[str, Any]:
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index() -> str:
-    return HTML
+async def index(request: Request) -> str:
+    username = authenticated_username(request)
+    token = csrf_token_value(username) if username else ""
+    return HTML.replace("__CSRF_TOKEN__", token)
 
 
 @app.on_event("startup")
@@ -1138,8 +1213,16 @@ def role_for_api_key(api_key: str | None) -> str | None:
 async def auth_middleware(request: Request, call_next):
     request.state.actor = "dashboard-user"
     request.state.role = None
+    if suspicious_embedding_request(dict(request.headers), ALLOWED_EMBED_HOSTS):
+        increment_security_metric("dashboard", "clickjack_attempt_count")
+        record_request("dashboard", getattr(getattr(request, "client", None), "host", "unknown"), request.url.path, blocked=True)
     if not request.url.path.startswith("/api/") or request.url.path.startswith("/api/auth/"):
-        return await call_next(request)
+        response = await call_next(request)
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Content-Security-Policy"] = "default-src 'self'; frame-ancestors 'none'"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        return response
     principal = authenticated_username(request)
     role = ROLE_ADMIN if principal else None
     if principal is None and request.method == "POST":
@@ -1149,9 +1232,27 @@ async def auth_middleware(request: Request, call_next):
             principal = request.headers.get("x-actor", f"api-key:{role or 'anonymous'}") if role else None
     if principal is None:
         raise HTTPException(status_code=401, detail="login_required")
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and not validate_csrf_token(request, principal):
+        increment_security_metric("dashboard", "csrf_attempt_count")
+        audit_event(
+            "dashboard",
+            "csrf-blocked",
+            {"path": request.url.path, "actor": principal},
+            severity="warning",
+            status="blocked",
+            target=request.url.path,
+            classification="csrf_attack",
+            actor=principal,
+        )
+        raise HTTPException(status_code=403, detail="invalid_csrf_token")
     request.state.actor = principal
     request.state.role = role or ROLE_ADMIN
-    return await call_next(request)
+    response = await call_next(request)
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Content-Security-Policy"] = "default-src 'self'; frame-ancestors 'none'"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    return response
 
 
 def validate_credentials(username: str, password: str) -> tuple[str, str]:
@@ -1162,23 +1263,13 @@ def validate_credentials(username: str, password: str) -> tuple[str, str]:
         raise HTTPException(status_code=400, detail=f"password_must_be_at_least_{AUTH_MIN_PASSWORD_LENGTH}_characters")
     return normalized_username, password
 
-
-def set_session_cookie(response: Response, username: str) -> None:
-    response.set_cookie(
-        SESSION_COOKIE_NAME,
-        session_cookie_value(username),
-        max_age=SESSION_COOKIE_MAX_AGE,
-        httponly=True,
-        samesite="lax",
-    )
-
-
 @app.get("/api/auth/session")
 async def session(request: Request) -> dict:
     username = authenticated_username(request)
     if username is None:
         raise HTTPException(status_code=401, detail="login_required")
-    return {"username": username}
+    token = csrf_token_value(username)
+    return {"username": username, "csrf_token": token}
 
 
 @app.post("/api/auth/signup")
@@ -1195,8 +1286,8 @@ async def signup(payload: dict[str, str], response: Response) -> dict:
         if "duplicate" in str(exc).lower():
             raise HTTPException(status_code=409, detail="username_already_exists")
         raise HTTPException(status_code=500, detail=str(exc))
-    set_session_cookie(response, username)
-    return {"username": username}
+    apply_session_cookies(response, username)
+    return {"username": username, "csrf_token": csrf_token_value(username)}
 
 
 @app.post("/api/auth/login")
@@ -1208,13 +1299,14 @@ async def login(payload: dict[str, str], response: Response) -> dict:
             user = cursor.fetchone()
     if not user or not verify_password(password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="invalid_username_or_password")
-    set_session_cookie(response, username)
-    return {"username": username}
+    apply_session_cookies(response, username)
+    return {"username": username, "csrf_token": csrf_token_value(username)}
 
 
 @app.post("/api/auth/logout")
 async def logout(response: Response) -> dict:
-    response.delete_cookie(SESSION_COOKIE_NAME, samesite="lax")
+    response.delete_cookie(SESSION_COOKIE_NAME, samesite="strict")
+    response.delete_cookie(CSRF_COOKIE_NAME, samesite="strict")
     return {"ok": True}
 
 

@@ -47,6 +47,7 @@ class ScenarioRequest(BaseModel):
     container_name: str | None = None
     selector: str | None = None
     latency_ms: int | None = None
+    ip_range: str | None = None
 
 
 def target_namespace(request: ScenarioRequest) -> str:
@@ -133,6 +134,16 @@ async def run_scenario_by_name(name: str, payload: dict[str, Any]) -> dict:
         return await latency(request)
     if name == "resource-pressure":
         return await resource_pressure(request)
+    if name == "ddos-simulation":
+        return await ddos_simulation(request)
+    if name == "mitm-simulation":
+        return await mitm_simulation(request)
+    if name == "xss-probe":
+        return await xss_probe(request)
+    if name == "clickjacking-probe":
+        return await clickjacking_probe(request)
+    if name == "csrf-probe":
+        return await csrf_probe(request)
     raise HTTPException(status_code=400, detail=f"unknown_scenario:{name}")
 
 
@@ -307,6 +318,72 @@ async def resource_pressure(request: ScenarioRequest) -> dict:
             "scenario": "resource-pressure",
             "target": request.target,
             "namespace": namespace,
+        }
+    )
+
+
+@app.post("/scenarios/ddos-simulation")
+async def ddos_simulation(request: ScenarioRequest) -> dict:
+    observe_event("chaos-engine", "ddos_simulation_injected")
+    return record(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "scenario": "ddos-simulation",
+            "target": request.target,
+            "namespace": target_namespace(request),
+            "ip_range": request.ip_range or "198.51.100.0/24",
+        }
+    )
+
+
+@app.post("/scenarios/mitm-simulation")
+async def mitm_simulation(request: ScenarioRequest) -> dict:
+    observe_event("chaos-engine", "mitm_simulation_injected")
+    return record(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "scenario": "mitm-simulation",
+            "target": request.target,
+            "namespace": target_namespace(request),
+        }
+    )
+
+
+@app.post("/scenarios/xss-probe")
+async def xss_probe(request: ScenarioRequest) -> dict:
+    observe_event("chaos-engine", "xss_probe_injected")
+    return record(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "scenario": "xss-probe",
+            "target": request.target,
+            "namespace": target_namespace(request),
+        }
+    )
+
+
+@app.post("/scenarios/clickjacking-probe")
+async def clickjacking_probe(request: ScenarioRequest) -> dict:
+    observe_event("chaos-engine", "clickjacking_probe_injected")
+    return record(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "scenario": "clickjacking-probe",
+            "target": request.target,
+            "namespace": target_namespace(request),
+        }
+    )
+
+
+@app.post("/scenarios/csrf-probe")
+async def csrf_probe(request: ScenarioRequest) -> dict:
+    observe_event("chaos-engine", "csrf_probe_injected")
+    return record(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "scenario": "csrf-probe",
+            "target": request.target,
+            "namespace": target_namespace(request),
         }
     )
 

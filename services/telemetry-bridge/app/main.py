@@ -13,6 +13,7 @@ import yaml
 
 from services.shared.history import record_history, recent_history
 from services.shared.observability import install_observability
+from services.shared.security import cluster_security_snapshot
 
 app = FastAPI(title="telemetry-bridge")
 logger = install_observability(app, "telemetry-bridge")
@@ -32,6 +33,19 @@ QUERIES = {
     "restarts": 'sum(label_replace(kube_pod_container_status_restarts_total{namespace="chaos-loop",container!=""}, "service", "$1", "container", "(.*)"))',
     "cpu": 'sum(label_replace(rate(container_cpu_usage_seconds_total{namespace="chaos-loop",container!=""}[1m]), "service", "$1", "container", "(.*)"))',
     "memory": 'sum(label_replace(container_memory_working_set_bytes{namespace="chaos-loop",container!=""}, "service", "$1", "container", "(.*)"))',
+    "requests_per_ip_per_second": 'sum(platform_security_requests_per_ip_per_second)',
+    "unique_source_ips": 'sum(platform_security_unique_source_ips)',
+    "connection_count": 'sum(platform_security_connection_count)',
+    "syn_flood_score": 'sum(platform_security_syn_flood_score)',
+    "tls_handshake_failures": 'sum(platform_security_tls_handshake_failures_total)',
+    "certificate_mismatch_count": 'sum(platform_security_certificate_mismatch_total)',
+    "unexpected_certificate_fingerprints": 'sum(platform_security_unexpected_certificate_fingerprint_total)',
+    "xss_attempt_count": 'sum(platform_security_xss_attempt_total)',
+    "clickjack_attempt_count": 'sum(platform_security_clickjacking_attempt_total)',
+    "csrf_attempt_count": 'sum(platform_security_csrf_attempt_total)',
+    "blocked_attempt_count": 'sum(platform_security_blocked_attempt_total)',
+    "request_rate_peak_per_endpoint": 'sum(platform_security_request_rate_peak_per_endpoint)',
+    "active_mitigations": 'sum(platform_security_active_mitigations)',
 }
 
 PER_SERVICE_QUERIES = {
@@ -41,6 +55,27 @@ PER_SERVICE_QUERIES = {
     "restarts": 'sum by (service) (label_replace(kube_pod_container_status_restarts_total{namespace="chaos-loop",container!=""}, "service", "$1", "container", "(.*)"))',
     "cpu": 'sum by (service) (label_replace(rate(container_cpu_usage_seconds_total{namespace="chaos-loop",container!=""}[1m]), "service", "$1", "container", "(.*)"))',
     "memory": 'sum by (service) (label_replace(container_memory_working_set_bytes{namespace="chaos-loop",container!=""}, "service", "$1", "container", "(.*)"))',
+    "requests_per_ip_per_second": 'sum by (service) (platform_security_requests_per_ip_per_second)',
+    "unique_source_ips": 'sum by (service) (platform_security_unique_source_ips)',
+    "connection_count": 'sum by (service) (platform_security_connection_count)',
+    "syn_flood_score": 'sum by (service) (platform_security_syn_flood_score)',
+    "tls_handshake_failures": 'sum by (service) (platform_security_tls_handshake_failures_total)',
+    "certificate_mismatch_count": 'sum by (service) (platform_security_certificate_mismatch_total)',
+    "unexpected_certificate_fingerprints": 'sum by (service) (platform_security_unexpected_certificate_fingerprint_total)',
+    "xss_attempt_count": 'sum by (service) (platform_security_xss_attempt_total)',
+    "clickjack_attempt_count": 'sum by (service) (platform_security_clickjacking_attempt_total)',
+    "csrf_attempt_count": 'sum by (service) (platform_security_csrf_attempt_total)',
+    "blocked_attempt_count": 'sum by (service) (platform_security_blocked_attempt_total)',
+    "request_rate_peak_per_endpoint": 'sum by (service) (platform_security_request_rate_peak_per_endpoint)',
+    "active_mitigations": 'sum by (service) (platform_security_active_mitigations)',
+}
+
+SECURITY_SLO_DEFAULTS = {
+    "xss_attempt_rate_max": 0.0,
+    "ddos_block_rate_min": 0.99,
+    "csrf_attempt_rate_max": 0.0,
+    "clickjack_attempt_rate_max": 0.0,
+    "tls_handshake_failures_max": 0.0,
 }
 
 
@@ -113,6 +148,20 @@ def merge_per_service(samples: dict[str, dict[str, float]], services: set[str]) 
     return merged
 
 
+def apply_security_snapshot(
+    aggregate_sample: dict[str, Any],
+    per_service_metrics: dict[str, dict[str, float]],
+) -> tuple[dict[str, Any], dict[str, dict[str, float]]]:
+    aggregate_security, per_service_security = cluster_security_snapshot(list(per_service_metrics.keys()) or None)
+    for key, value in aggregate_security.items():
+        aggregate_sample[key] = float(value)
+    for service, security_metrics in per_service_security.items():
+        target = per_service_metrics.setdefault(service, {})
+        for key, value in security_metrics.items():
+            target[key] = float(value)
+    return aggregate_sample, per_service_metrics
+
+
 def load_slos() -> dict[str, dict[str, float]]:
     if not SLO_PATH.exists():
         return {}
@@ -132,13 +181,34 @@ def evaluate_slos(metrics: dict[str, dict[str, float]], slos: dict[str, dict[str
         latency_target = float(targets.get("latency_p95_max", 0.5))
         error_target = float(targets.get("error_rate_max", 0.05))
         availability_target = float(targets.get("availability_min", 0.99))
+        ddos_block_rate_min = float(targets.get("ddos_block_rate_min", SECURITY_SLO_DEFAULTS["ddos_block_rate_min"]))
+        xss_attempt_rate_max = float(targets.get("xss_attempt_rate_max", SECURITY_SLO_DEFAULTS["xss_attempt_rate_max"]))
+        csrf_attempt_rate_max = float(targets.get("csrf_attempt_rate_max", SECURITY_SLO_DEFAULTS["csrf_attempt_rate_max"]))
+        clickjack_attempt_rate_max = float(
+            targets.get("clickjack_attempt_rate_max", SECURITY_SLO_DEFAULTS["clickjack_attempt_rate_max"])
+        )
+        tls_handshake_failures_max = float(
+            targets.get("tls_handshake_failures_max", SECURITY_SLO_DEFAULTS["tls_handshake_failures_max"])
+        )
         latency_ok = observed.get("latency_p95", 0.0) <= latency_target
         error_ok = observed.get("error_rate", 0.0) <= error_target
         availability_ok = observed.get("availability", 1.0) >= availability_target
+        xss_ok = observed.get("xss_attempt_count", 0.0) <= xss_attempt_rate_max
+        csrf_ok = observed.get("csrf_attempt_count", 0.0) <= csrf_attempt_rate_max
+        clickjack_ok = observed.get("clickjack_attempt_count", 0.0) <= clickjack_attempt_rate_max
+        tls_ok = observed.get("tls_handshake_failures", 0.0) <= tls_handshake_failures_max
+        total_connections = max(observed.get("connection_count", 0.0), 1.0)
+        ddos_block_rate = observed.get("blocked_attempt_count", 0.0) / total_connections if total_connections > 0 else 1.0
+        ddos_ok = ddos_block_rate >= ddos_block_rate_min or observed.get("requests_per_ip_per_second", 0.0) == 0.0
         checks = [
             ("latency_p95", latency_ok),
             ("error_rate", error_ok),
             ("availability", availability_ok),
+            ("xss_attempt_count", xss_ok),
+            ("csrf_attempt_count", csrf_ok),
+            ("clickjack_attempt_count", clickjack_ok),
+            ("tls_handshake_failures", tls_ok),
+            ("ddos_block_rate", ddos_ok),
         ]
         passed = sum(1 for _, ok in checks if ok)
         compliance = round((passed / len(checks)) * 100.0, 2)
@@ -148,6 +218,11 @@ def evaluate_slos(metrics: dict[str, dict[str, float]], slos: dict[str, dict[str
                 observed.get("latency_p95", 0.0) / max(latency_target, 0.0001),
                 observed.get("error_rate", 0.0) / max(error_target, 0.0001),
                 availability_target / max(observed.get("availability", 0.0001), 0.0001),
+                observed.get("xss_attempt_count", 0.0) / max(xss_attempt_rate_max + 0.0001, 0.0001),
+                observed.get("csrf_attempt_count", 0.0) / max(csrf_attempt_rate_max + 0.0001, 0.0001),
+                observed.get("clickjack_attempt_count", 0.0) / max(clickjack_attempt_rate_max + 0.0001, 0.0001),
+                observed.get("tls_handshake_failures", 0.0) / max(tls_handshake_failures_max + 0.0001, 0.0001),
+                ddos_block_rate_min / max(ddos_block_rate, 0.0001),
             ),
             3,
         )
@@ -159,11 +234,16 @@ def evaluate_slos(metrics: dict[str, dict[str, float]], slos: dict[str, dict[str
                 "violations": violations,
                 "burn_rate": burn_rate,
                 "targets": {
-                    "latency_p95_max": latency_target,
-                    "error_rate_max": error_target,
-                    "availability_min": availability_target,
-                },
-                "observed": observed,
+                        "latency_p95_max": latency_target,
+                        "error_rate_max": error_target,
+                        "availability_min": availability_target,
+                        "ddos_block_rate_min": ddos_block_rate_min,
+                        "xss_attempt_rate_max": xss_attempt_rate_max,
+                        "csrf_attempt_rate_max": csrf_attempt_rate_max,
+                        "clickjack_attempt_rate_max": clickjack_attempt_rate_max,
+                        "tls_handshake_failures_max": tls_handshake_failures_max,
+                    },
+                "observed": {**observed, "ddos_block_rate": round(ddos_block_rate, 4)},
             }
         )
     overall = round(sum(item["compliance"] for item in items) / len(items), 2) if items else 100.0
@@ -189,6 +269,7 @@ async def collect_features() -> None:
                 for values in per_service_raw.values():
                     services.update(values.keys())
                 latest_per_service = merge_per_service(per_service_raw, services)
+                sample, latest_per_service = apply_security_snapshot(sample, latest_per_service)
                 sample["per_service"] = latest_per_service
         except Exception as exc:
             sample["collector_error"] = str(exc)
@@ -197,6 +278,9 @@ async def collect_features() -> None:
                 sample.setdefault(key, 0.0)
             sample.setdefault("loki_errors", 0.0)
             sample.setdefault("availability", 1.0)
+            for key in QUERIES:
+                sample.setdefault(key, 0.0)
+            sample, latest_per_service = apply_security_snapshot(sample, latest_per_service)
             sample["per_service"] = latest_per_service
         history.append(sample)
         record_history("telemetry-history", "telemetry-bridge", sample)

@@ -149,6 +149,9 @@ def install_test_stubs() -> None:
         "services.shared.store",
         ensure_table=lambda *args, **kwargs: None,
         pg_conn=lambda *args, **kwargs: DummyConnection(),
+        redis_client=lambda *args, **kwargs: types.SimpleNamespace(scan_iter=lambda match=None: []),
+        redis_json_get=lambda *args, **kwargs: {},
+        redis_json_set=lambda *args, **kwargs: None,
     )
     sys.modules["services.shared.store"] = store
 
@@ -166,6 +169,7 @@ def install_test_stubs() -> None:
         HTMLResponse=str,
         StreamingResponse=object,
         Response=object,
+        JSONResponse=object,
     )
     sys.modules["fastapi.responses"] = fastapi_responses
 
@@ -212,6 +216,9 @@ def install_test_stubs() -> None:
         V1ObjectMeta=object,
         V1NetworkPolicySpec=object,
         V1LabelSelector=object,
+        V1NetworkPolicyIngressRule=object,
+        V1IPBlock=object,
+        V1NetworkPolicyPeer=object,
         V1Job=object,
         V1JobSpec=object,
         V1PodTemplateSpec=object,

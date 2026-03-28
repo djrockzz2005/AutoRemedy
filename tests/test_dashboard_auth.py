@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -28,6 +29,13 @@ class DashboardAuthTests(unittest.TestCase):
             principal, role = module.bearer_principal_and_role("Bearer fake")
         self.assertEqual(principal, "alice@example.com")
         self.assertEqual(role, "admin")
+
+    def test_csrf_token_round_trip(self) -> None:
+        module = load_module("services/dashboard/app/main.py", "dashboard_main_csrf")
+        token = module.csrf_token_value("operator")
+        request = SimpleNamespace(headers={"x-csrf-token": token}, cookies={module.CSRF_COOKIE_NAME: token})
+
+        self.assertTrue(module.validate_csrf_token(request, "operator"))
 
 
 if __name__ == "__main__":

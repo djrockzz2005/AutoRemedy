@@ -15,6 +15,7 @@ class TelemetryBridgeTests(unittest.TestCase):
                 "latency_p95": 0.8,
                 "error_rate": 0.02,
                 "availability": 0.99,
+                "tls_handshake_failures": 1,
             }
         }
         slos = {
@@ -22,6 +23,7 @@ class TelemetryBridgeTests(unittest.TestCase):
                 "latency_p95_max": 0.5,
                 "error_rate_max": 0.03,
                 "availability_min": 0.995,
+                "tls_handshake_failures_max": 0,
             }
         }
 
@@ -31,6 +33,21 @@ class TelemetryBridgeTests(unittest.TestCase):
         self.assertFalse(status["items"][0]["healthy"])
         self.assertIn("latency_p95", status["items"][0]["violations"])
         self.assertIn("availability", status["items"][0]["violations"])
+        self.assertIn("tls_handshake_failures", status["items"][0]["violations"])
+
+    def test_apply_security_snapshot_merges_security_metrics(self) -> None:
+        original = MODULE.cluster_security_snapshot
+        MODULE.cluster_security_snapshot = lambda services=None: (
+            {"xss_attempt_count": 3.0},
+            {"api-gateway": {"blocked_attempt_count": 5.0, "requests_per_ip_per_second": 12.0}},
+        )
+        try:
+            sample, per_service = MODULE.apply_security_snapshot({}, {"api-gateway": {"request_rate": 1.0}})
+        finally:
+            MODULE.cluster_security_snapshot = original
+
+        self.assertEqual(sample["xss_attempt_count"], 3.0)
+        self.assertEqual(per_service["api-gateway"]["blocked_attempt_count"], 5.0)
 
 
 if __name__ == "__main__":

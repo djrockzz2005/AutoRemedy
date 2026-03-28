@@ -70,6 +70,16 @@ def attributed_target(event: dict) -> str | None:
         return error_target or availability_target
     if classification == "application_error_burst":
         return top_service(per_service, "loki_errors", True)
+    if classification == "ddos_attack":
+        return top_service(per_service, "requests_per_ip_per_second", True) or top_service(per_service, "connection_count", True)
+    if classification == "mitm_attack":
+        return top_service(per_service, "tls_handshake_failures", True) or top_service(per_service, "certificate_mismatch_count", True)
+    if classification == "xss_attack":
+        return top_service(per_service, "xss_attempt_count", True)
+    if classification == "clickjacking_attack":
+        return top_service(per_service, "clickjack_attempt_count", True)
+    if classification == "csrf_attack":
+        return top_service(per_service, "csrf_attempt_count", True)
     return None
 
 
@@ -79,6 +89,11 @@ def default_target_for(classification: str | None) -> str:
         "latency_spike": "order-service",
         "availability_regression": "payment-service",
         "application_error_burst": "api-gateway",
+        "ddos_attack": "api-gateway",
+        "mitm_attack": "api-gateway",
+        "xss_attack": "api-gateway",
+        "clickjacking_attack": "dashboard",
+        "csrf_attack": "dashboard",
     }.get(classification or "", "api-gateway")
 
 
@@ -157,6 +172,28 @@ def plan_actions(event: dict) -> list[dict]:
             ]
         return [
             {"action": "restart_deployment", "target": target or default_target_for(classification)},
+        ]
+    if classification == "ddos_attack":
+        return [
+            {"action": "apply_rate_limit", "target": target or default_target_for(classification)},
+            {"action": "scale_under_ddos", "target": target or default_target_for(classification), "replicas": 6},
+        ]
+    if classification == "mitm_attack":
+        return [
+            {"action": "enforce_mtls", "target": target or default_target_for(classification)},
+            {"action": "rotate_certificates", "target": target or default_target_for(classification)},
+        ]
+    if classification == "xss_attack":
+        return [
+            {"action": "enable_waf_rules", "target": target or default_target_for(classification)},
+        ]
+    if classification == "clickjacking_attack":
+        return [
+            {"action": "enforce_frame_policy", "target": target or default_target_for(classification)},
+        ]
+    if classification == "csrf_attack":
+        return [
+            {"action": "lockdown_mutations", "target": target or default_target_for(classification)},
         ]
     return [{"action": "restart_deployment", "target": default_target_for(classification)}]
 
