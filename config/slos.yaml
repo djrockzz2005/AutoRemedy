@@ -1,0 +1,17 @@
+services:
+  api-gateway:
+    latency_p95_max: 0.5
+    error_rate_max: 0.05
+    availability_min: 0.99
+  order-service:
+    latency_p95_max: 0.7
+    error_rate_max: 0.05
+    availability_min: 0.99
+  payment-service:
+    latency_p95_max: 0.6
+    error_rate_max: 0.03
+    availability_min: 0.995
+  recommendation-service:
+    latency_p95_max: 0.4
+    error_rate_max: 0.08
+    availability_min: 0.98

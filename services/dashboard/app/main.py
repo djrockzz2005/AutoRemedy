@@ -8,11 +8,16 @@ from typing import Any
 from urllib.parse import urlencode
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from kubernetes import client, config
 
-from services.shared.observability import install_observability
+from services.shared.audit import audit_event
+from services.shared.auth import ROLE_ADMIN, ROLE_OPERATOR, bearer_principal_and_role
+from services.shared.migrations import migrate
+from services.shared.maintenance import prune_tables
+from services.shared.notifications import notification_worker
+from services.shared.observability import install_observability, traced_get, traced_post
 
 app = FastAPI(title="dashboard")
 logger = install_observability(app, "dashboard")
@@ -21,9 +26,12 @@ DETECTOR_URL = os.getenv("DETECTOR_URL", "http://anomaly-detector:8000")
 DECISION_URL = os.getenv("DECISION_URL", "http://decision-engine:8000")
 RECOVERY_URL = os.getenv("RECOVERY_URL", "http://recovery-engine:8000")
 CHAOS_URL = os.getenv("CHAOS_URL", "http://chaos-engine:8000")
+TELEMETRY_URL = os.getenv("TELEMETRY_URL", "http://telemetry-bridge:8000")
 PLATFORM_NAMESPACE = os.getenv("PLATFORM_NAMESPACE", "chaos-loop")
 TARGET_NAMESPACES = [item.strip() for item in os.getenv("TARGET_NAMESPACES", PLATFORM_NAMESPACE).split(",") if item.strip()]
 DOCKER_SOCKET_PATH = os.getenv("DOCKER_SOCKET_PATH", "/var/run/docker.sock")
+OPERATOR_API_KEY = os.getenv("DASHBOARD_OPERATOR_API_KEY", "")
+ADMIN_API_KEY = os.getenv("DASHBOARD_ADMIN_API_KEY", "")
 
 
 HTML = """
@@ -43,7 +51,7 @@ HTML = """
       .wrap { max-width:1500px; margin:0 auto; padding:24px; }
       .hero, .top-grid, .main-grid, .bottom-grid { display:grid; gap:18px; }
       .hero { grid-template-columns: 1.2fr .8fr; margin-bottom:18px; }
-      .top-grid { grid-template-columns: repeat(4, 1fr); margin-bottom:18px; }
+      .top-grid { grid-template-columns: repeat(5, 1fr); margin-bottom:18px; }
       .main-grid { grid-template-columns: 1.15fr .85fr; margin-bottom:18px; }
       .bottom-grid { grid-template-columns: 1fr 1fr; }
       .stack { display:grid; gap:18px; }
@@ -112,6 +120,11 @@ HTML = """
           <h3>Operator Actions</h3>
           <div class="note" style="margin:8px 0 12px">Pick any discovered workload and inject chaos or trigger healing.</div>
           <div class="control-grid">
+            <div class="split">
+              <input id="actorInput" type="text" placeholder="Actor name" />
+              <input id="apiKeyInput" type="password" placeholder="API key" />
+            </div>
+            <input id="bearerTokenInput" type="password" placeholder="Bearer token (optional)" />
             <select id="workloadSelect"></select>
             <div class="split">
               <input id="latencyInput" type="number" min="50" step="50" value="1500" placeholder="Latency ms" />
@@ -134,6 +147,7 @@ HTML = """
         <div class="card"><div class="metric-label">Classification</div><div id="classification" class="kpi">steady</div><div class="micro" id="classificationMeta">No active anomaly</div></div>
         <div class="card"><div class="metric-label">Recovery action</div><div id="recovery" class="kpi">none</div><div class="micro" id="recoveryMeta">Autonomous remediation idle</div></div>
         <div class="card"><div class="metric-label">Latency p95</div><div id="latency" class="kpi">0ms</div><div class="micro" id="latencyMeta">Live request path health</div></div>
+        <div class="card"><div class="metric-label">SLO compliance</div><div id="sloCompliance" class="kpi">100%</div><div class="micro" id="sloMeta">Error budget healthy</div></div>
       </section>
 
       <section class="main-grid">
@@ -193,12 +207,20 @@ HTML = """
             <h3>Decision Log</h3>
             <table id="decisions"></table>
           </section>
+          <section class="card">
+            <h3>SLO Status</h3>
+            <table id="slos"></table>
+          </section>
         </div>
         <div class="stack">
           <section class="card">
             <h3>Docker Runtime</h3>
             <div id="dockerSummary" class="note" style="margin:8px 0 12px">Inspecting host Docker when the API is reachable.</div>
             <div id="dockerContainers" class="list"></div>
+          </section>
+          <section class="card">
+            <h3>Chaos Experiments</h3>
+            <table id="experiments"></table>
           </section>
         </div>
       </section>
@@ -276,6 +298,7 @@ HTML = """
         lastStreamAt = Date.now();
         document.getElementById('liveState').textContent = 'Streaming live from the cluster';
         const scores = data.scores || [];
+        const sloStatus = data.slos || { overall_compliance: 100, items: [] };
         draw(scores.map(item => item.score));
         const latest = scores[scores.length - 1];
         const latestSample = latest && latest.sample ? latest.sample : {};
@@ -285,17 +308,23 @@ HTML = """
         document.getElementById('classification').textContent = latestEvent ? latestEvent.classification : 'steady';
         document.getElementById('recovery').textContent = latestRecovery ? latestRecovery.action : 'none';
         document.getElementById('latency').textContent = `${Math.round((latestSample.latency_p95 || 0) * 1000)}ms`;
+        document.getElementById('sloCompliance').textContent = `${Math.round(sloStatus.overall_compliance || 100)}%`;
         document.getElementById('scoreMeta').textContent = latest ? `Updated ${latest.ts.slice(11,19)}` : 'IsolationForest signal';
         document.getElementById('classificationMeta').textContent = latestEvent ? `Score ${latestEvent.score.toFixed(2)}` : 'No active anomaly';
         document.getElementById('recoveryMeta').textContent = latestRecovery ? `${latestRecovery.status} at ${latestRecovery.ts.slice(11,19)}` : 'Autonomous remediation idle';
         document.getElementById('latencyMeta').textContent = `Availability ${(latestSample.availability || 1).toFixed(2)}`;
+        document.getElementById('sloMeta').textContent = (sloStatus.items || []).some(item => !item.healthy) ? 'SLO violations active' : 'Error budget healthy';
         document.getElementById('sampleTime').textContent = latest ? latest.ts.slice(11,19) : '--:--:--';
         document.getElementById('windowSize').textContent = String(scores.length);
         document.getElementById('signalState').textContent = latest && latest.score >= 0.58 ? 'Active incident' : 'Nominal';
         const timelineRows = (data.timeline || []).slice(-8).reverse().map(i => `<tr><td>${i.ts.slice(11,19)}</td><td>${i.namespace || '-'}</td><td>${i.action}</td><td>${i.status}</td></tr>`).join('');
         const decisionRows = (data.decisions || []).slice(-8).reverse().map(i => `<tr><td>${i.event.classification}</td><td>${i.actions.map(a => a.action).join(', ')}</td></tr>`).join('');
+        const sloRows = (sloStatus.items || []).map(i => `<tr><td>${i.service}</td><td>${i.compliance}%</td><td>${i.burn_rate}</td><td>${i.violations.join(', ') || 'ok'}</td></tr>`).join('');
+        const experimentRows = (data.experiments || []).slice(-8).reverse().map(i => `<tr><td>${i.name}</td><td>${i.target || '-'}</td><td>${i.evaluation && i.evaluation.reason ? i.evaluation.reason : i.status}</td><td>${i.evaluation && i.evaluation.healed ? 'healed' : i.status}</td></tr>`).join('');
         document.getElementById('timeline').innerHTML = '<tr><th>Time</th><th>NS</th><th>Action</th><th>Status</th></tr>' + (timelineRows || '<tr><td colspan="4" class="empty">No recovery actions yet.</td></tr>');
         document.getElementById('decisions').innerHTML = '<tr><th>Event</th><th>Actions</th></tr>' + (decisionRows || '<tr><td colspan="2" class="empty">No decisions yet.</td></tr>');
+        document.getElementById('slos').innerHTML = '<tr><th>Service</th><th>Compliance</th><th>Burn</th><th>Status</th></tr>' + (sloRows || '<tr><td colspan="4" class="empty">No SLOs configured.</td></tr>');
+        document.getElementById('experiments').innerHTML = '<tr><th>Name</th><th>Target</th><th>Result</th><th>Status</th></tr>' + (experimentRows || '<tr><td colspan="4" class="empty">No experiments yet.</td></tr>');
         const feed = [];
         (data.events || []).slice(-4).reverse().forEach(item => feed.push(`<div class="event"><div><strong>${item.classification}</strong><small>${item.ts.slice(11,19)} | score ${item.score.toFixed(2)}</small></div><div class="pill">detect</div></div>`));
         (data.decisions || []).slice(-4).reverse().forEach(item => feed.push(`<div class="event"><div><strong>${item.event.classification}</strong><small>${item.actions.map(a => a.action).join(', ')}</small></div><div class="pill">decide</div></div>`));
@@ -384,10 +413,20 @@ HTML = """
         };
       }
 
+      function authHeaders() {
+        const apiKey = document.getElementById('apiKeyInput').value;
+        const bearerToken = document.getElementById('bearerTokenInput').value;
+        const actor = document.getElementById('actorInput').value || 'dashboard-user';
+        const headers = {'Content-Type':'application/json', 'X-Actor': actor};
+        if (bearerToken) headers['Authorization'] = `Bearer ${bearerToken}`;
+        if (apiKey) headers['X-API-Key'] = apiKey;
+        return headers;
+      }
+
       async function triggerSelected(scenario) {
         const payload = selectedPayload();
         payload.latency_ms = Number(document.getElementById('latencyInput').value || 1500);
-        await fetch(`/api/chaos/${scenario}`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+        await fetch(`/api/chaos/${scenario}`, { method:'POST', headers: authHeaders(), body: JSON.stringify(payload) });
         await refreshSnapshot();
         await refreshDetails();
       }
@@ -396,7 +435,7 @@ HTML = """
         const payload = selectedPayload();
         payload.action = action;
         if (action === 'scale_deployment') payload.replicas = Number(document.getElementById('scaleInput').value || 3);
-        await fetch('/api/recover', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+        await fetch('/api/recover', { method:'POST', headers: authHeaders(), body: JSON.stringify(payload) });
         await refreshSnapshot();
         await refreshDetails();
       }
@@ -568,28 +607,39 @@ async def index() -> str:
     return HTML
 
 
+@app.on_event("startup")
+async def startup() -> None:
+    migrate()
+    prune_tables(int(os.getenv("PLATFORM_RETENTION_DAYS", "14")))
+    asyncio.create_task(notification_worker())
+
+
 async def proxy(url: str) -> dict:
     async with httpx.AsyncClient(timeout=5.0) as http_client:
-        response = await http_client.get(url)
+        response = await traced_get(http_client, url)
         response.raise_for_status()
         return response.json()
 
 
 async def snapshot_payload() -> dict:
     async with httpx.AsyncClient(timeout=5.0) as http_client:
-        scores_response, events_response, decisions_response, timeline_response = await asyncio.gather(
-            http_client.get(f"{DETECTOR_URL}/scores"),
-            http_client.get(f"{DETECTOR_URL}/events"),
-            http_client.get(f"{DECISION_URL}/decisions"),
-            http_client.get(f"{RECOVERY_URL}/timeline"),
+        scores_response, events_response, decisions_response, timeline_response, slo_response, experiments_response = await asyncio.gather(
+            traced_get(http_client, f"{DETECTOR_URL}/scores"),
+            traced_get(http_client, f"{DETECTOR_URL}/events"),
+            traced_get(http_client, f"{DECISION_URL}/decisions"),
+            traced_get(http_client, f"{RECOVERY_URL}/timeline"),
+            traced_get(http_client, f"{TELEMETRY_URL}/slo/status"),
+            traced_get(http_client, f"{CHAOS_URL}/experiments"),
         )
-        for response in (scores_response, events_response, decisions_response, timeline_response):
+        for response in (scores_response, events_response, decisions_response, timeline_response, slo_response, experiments_response):
             response.raise_for_status()
         return {
             "scores": scores_response.json().get("items", []),
             "events": events_response.json().get("items", []),
             "decisions": decisions_response.json().get("items", []),
             "timeline": timeline_response.json().get("items", []),
+            "slos": slo_response.json(),
+            "experiments": experiments_response.json().get("items", []),
             "workloads": list_workloads(),
         }
 
@@ -612,6 +662,31 @@ async def live() -> StreamingResponse:
             await asyncio.sleep(1)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+def role_for_api_key(api_key: str | None) -> str | None:
+    if api_key and ADMIN_API_KEY and api_key == ADMIN_API_KEY:
+        return "admin"
+    if api_key and OPERATOR_API_KEY and api_key == OPERATOR_API_KEY:
+        return "operator"
+    return None
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    if request.method != "POST" or not request.url.path.startswith("/api/"):
+        return await call_next(request)
+    principal, role = bearer_principal_and_role(request.headers.get("authorization"))
+    if role is None:
+        role = role_for_api_key(request.headers.get("x-api-key"))
+        principal = request.headers.get("x-actor", f"api-key:{role or 'anonymous'}")
+    if request.url.path.startswith("/api/chaos/") and role != ROLE_ADMIN:
+        raise HTTPException(status_code=403, detail="admin_api_key_required")
+    if request.url.path == "/api/recover" and role not in {ROLE_OPERATOR, ROLE_ADMIN}:
+        raise HTTPException(status_code=403, detail="operator_api_key_required")
+    request.state.actor = principal or request.headers.get("x-actor", f"api-key:{role or 'anonymous'}")
+    request.state.role = role
+    return await call_next(request)
 
 
 @app.get("/api/kube/workload")
@@ -637,16 +712,37 @@ async def docker_inventory() -> dict:
 
 
 @app.post("/api/chaos/{scenario}")
-async def chaos(scenario: str, payload: dict) -> dict:
+async def chaos(scenario: str, payload: dict, request: Request) -> dict:
     async with httpx.AsyncClient(timeout=8.0) as http_client:
-        response = await http_client.post(f"{CHAOS_URL}/scenarios/{scenario}", json=payload)
+        response = await traced_post(http_client, f"{CHAOS_URL}/scenarios/{scenario}", json=payload)
         response.raise_for_status()
-        return response.json()
+        result = response.json()
+    audit_event(
+        "dashboard",
+        "manual-chaos",
+        {"scenario": scenario, "payload": payload, "result": result},
+        severity="warning",
+        status="completed",
+        target=payload.get("target"),
+        actor=getattr(request.state, "actor", "dashboard-user"),
+    )
+    return result
 
 
 @app.post("/api/recover")
-async def recover(payload: dict) -> dict:
+async def recover(payload: dict, request: Request) -> dict:
     async with httpx.AsyncClient(timeout=8.0) as http_client:
-        response = await http_client.post(f"{RECOVERY_URL}/recover", json=payload)
+        response = await traced_post(http_client, f"{RECOVERY_URL}/recover", json=payload)
         response.raise_for_status()
-        return response.json()
+        result = response.json()
+    audit_event(
+        "dashboard",
+        "manual-recovery",
+        {"payload": payload, "result": result},
+        severity="warning",
+        status="completed",
+        target=payload.get("target"),
+        classification=payload.get("reason"),
+        actor=getattr(request.state, "actor", "dashboard-user"),
+    )
+    return result

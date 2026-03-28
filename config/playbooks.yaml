@@ -1,0 +1,18 @@
+playbooks:
+  pod_instability:
+    - action: restart_deployment
+      target: "{target}"
+  latency_spike:
+    - action: scale_deployment
+      target: "{target}"
+      replicas: 3
+    - action: reset_latency
+      target: "{target}"
+  availability_regression:
+    - action: clear_network_partition
+      target: "{target}"
+    - action: restart_deployment
+      target: "{target}"
+  application_error_burst:
+    - action: restart_deployment
+      target: "{target}"

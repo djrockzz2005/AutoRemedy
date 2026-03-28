@@ -1,22 +1,34 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from kubernetes import client, config
 from pydantic import BaseModel
+import yaml
 
-from services.shared.observability import install_observability, observe_event
+from services.shared.audit import audit_event
+from services.shared.history import record_history, recent_history
+from services.shared.notifications import notification_worker, notify
+from services.shared.observability import install_observability, observe_event, traced_get
 
 app = FastAPI(title="chaos-engine")
 logger = install_observability(app, "chaos-engine")
 history: list[dict] = []
+experiments: list[dict] = []
 NAMESPACE = os.getenv("PLATFORM_NAMESPACE", "chaos-loop")
 DEFAULT_TARGET_NAMESPACES = [
     item.strip() for item in os.getenv("TARGET_NAMESPACES", NAMESPACE).split(",") if item.strip()
 ]
+SCHEDULE_PATH = Path(os.getenv("CHAOS_SCHEDULE_PATH", "/app/config/chaos-schedules.yaml"))
+SCHEDULE_POLL_SECONDS = float(os.getenv("CHAOS_SCHEDULE_POLL_SECONDS", "5"))
+TELEMETRY_URL = os.getenv("TELEMETRY_URL", "http://telemetry-bridge:8000")
+schedule_state: dict[str, float] = {}
 
 
 def load_k8s() -> tuple[client.AppsV1Api, client.CoreV1Api, client.NetworkingV1Api, client.BatchV1Api]:
@@ -69,7 +81,122 @@ def patch_env(containers: list[client.V1Container], container_name: str | None, 
 def record(event: dict) -> dict:
     history.append(event)
     del history[:-100]
+    record_history("chaos-history", "chaos-engine", event)
     return event
+
+
+def record_experiment(event: dict) -> dict:
+    experiments.append(event)
+    del experiments[:-100]
+    record_history("chaos-experiments", "chaos-engine", event)
+    return event
+
+
+def load_schedules() -> list[dict[str, Any]]:
+    if not SCHEDULE_PATH.exists():
+        return []
+    try:
+        payload = yaml.safe_load(SCHEDULE_PATH.read_text()) or {}
+    except Exception as exc:
+        logger.warning("Failed to load chaos schedules", extra={"path": str(SCHEDULE_PATH), "error": str(exc)})
+        return []
+    items = payload.get("experiments", payload)
+    return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+
+async def evaluate_experiment(target: str) -> dict[str, Any]:
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await traced_get(client, f"{TELEMETRY_URL}/slo/status")
+            response.raise_for_status()
+            payload = response.json()
+    except Exception as exc:
+        return {"healed": False, "reason": str(exc)}
+    item = next((entry for entry in payload.get("items", []) if entry.get("service") == target), None)
+    if not item:
+        return {"healed": True, "reason": "no_slo_for_target"}
+    return {
+        "healed": bool(item.get("healthy")),
+        "reason": "slo_healthy" if item.get("healthy") else "slo_violated",
+        "compliance": item.get("compliance"),
+        "violations": item.get("violations", []),
+    }
+
+
+async def run_scenario_by_name(name: str, payload: dict[str, Any]) -> dict:
+    request = ScenarioRequest(**payload)
+    if name == "pod-crash":
+        return await pod_crash(request)
+    if name == "network-partition":
+        return await network_partition(request)
+    if name == "latency":
+        return await latency(request)
+    if name == "resource-pressure":
+        return await resource_pressure(request)
+    raise HTTPException(status_code=400, detail=f"unknown_scenario:{name}")
+
+
+async def execute_experiment(plan: dict[str, Any]) -> dict[str, Any]:
+    started = datetime.now(timezone.utc).isoformat()
+    target = str(plan.get("target", ""))
+    entry = {
+        "ts": started,
+        "name": plan.get("name", "unnamed"),
+        "target": target,
+        "status": "running",
+        "steps": [],
+    }
+    record_experiment(entry)
+    for step in plan.get("steps", []):
+        if "wait_seconds" in step:
+            await asyncio.sleep(float(step.get("wait_seconds", 0)))
+            entry["steps"].append({"wait_seconds": float(step.get("wait_seconds", 0)), "status": "completed"})
+            continue
+        scenario = str(step.get("scenario"))
+        payload = {**step.get("payload", {}), "target": target or step.get("target")}
+        result = await run_scenario_by_name(scenario, payload)
+        entry["steps"].append({"scenario": scenario, "payload": payload, "result": result, "status": "completed"})
+    observe_window = float(plan.get("observe_seconds", 30))
+    if observe_window > 0:
+        await asyncio.sleep(observe_window)
+    evaluation = await evaluate_experiment(target)
+    entry["status"] = "completed"
+    entry["completed_at"] = datetime.now(timezone.utc).isoformat()
+    entry["evaluation"] = evaluation
+    audit_event(
+        "chaos-engine",
+        "chaos-experiment",
+        entry,
+        severity="warning" if evaluation.get("healed", False) else "critical",
+        status="completed",
+        target=target,
+    )
+    await notify(
+        "chaos-engine",
+        "chaos_experiment_completed",
+        "warning" if evaluation.get("healed", False) else "critical",
+        f"Chaos experiment {entry['name']} {'self-healed' if evaluation.get('healed') else 'violated SLO'}",
+        entry,
+    )
+    return entry
+
+
+async def schedule_loop() -> None:
+    while True:
+        for plan in load_schedules():
+            name = str(plan.get("name", "unnamed"))
+            every = float(plan.get("interval_seconds", 0))
+            if every <= 0:
+                continue
+            last_run = schedule_state.get(name, 0.0)
+            if (datetime.now(timezone.utc).timestamp() - last_run) < every:
+                continue
+            schedule_state[name] = datetime.now(timezone.utc).timestamp()
+            try:
+                await execute_experiment(plan)
+            except Exception as exc:
+                logger.exception("Scheduled experiment failed", extra={"name": name, "error": str(exc)})
+        await asyncio.sleep(SCHEDULE_POLL_SECONDS)
 
 
 @app.post("/scenarios/pod-crash")
@@ -186,7 +313,17 @@ async def resource_pressure(request: ScenarioRequest) -> dict:
 
 @app.get("/history")
 async def get_history() -> dict:
-    return {"items": history}
+    return {"items": recent_history("chaos-history", 100) or history}
+
+
+@app.get("/experiments")
+async def get_experiments() -> dict:
+    return {"items": recent_history("chaos-experiments", 100) or experiments}
+
+
+@app.post("/experiments/run")
+async def run_experiment(payload: dict[str, Any]) -> dict:
+    return await execute_experiment(payload)
 
 
 @app.get("/targets")
@@ -224,3 +361,9 @@ async def targets() -> dict:
                 }
             )
     return {"items": items}
+
+
+@app.on_event("startup")
+async def startup() -> None:
+    asyncio.create_task(notification_worker())
+    asyncio.create_task(schedule_loop())

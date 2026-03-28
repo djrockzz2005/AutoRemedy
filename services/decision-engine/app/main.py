@@ -3,13 +3,17 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from collections import defaultdict
+from pathlib import Path
 from typing import Any
 
 import httpx
 from fastapi import FastAPI
+import yaml
 
-from services.shared.observability import install_observability
+from services.shared.audit import audit_event
+from services.shared.history import record_history, recent_history
+from services.shared.notifications import notification_worker, notify
+from services.shared.observability import install_observability, traced_get, traced_post
 
 app = FastAPI(title="decision-engine")
 logger = install_observability(app, "decision-engine")
@@ -18,9 +22,17 @@ DETECTOR_URL = os.getenv("DETECTOR_URL", "http://anomaly-detector:8000")
 RECOVERY_URL = os.getenv("RECOVERY_URL", "http://recovery-engine:8000")
 DECISION_INTERVAL = float(os.getenv("DECISION_INTERVAL_SECONDS", "2"))
 COOLDOWN_SECONDS = float(os.getenv("COOLDOWN_SECONDS", "60"))
+MAX_RETRIES_PER_TARGET = int(os.getenv("MAX_RETRIES_PER_TARGET", "3"))
+CIRCUIT_BREAKER_THRESHOLD = int(os.getenv("CIRCUIT_BREAKER_THRESHOLD", "3"))
+CIRCUIT_BREAKER_SECONDS = float(os.getenv("CIRCUIT_BREAKER_SECONDS", "300"))
+PLAYBOOK_PATH = Path(os.getenv("PLAYBOOK_PATH", "/app/config/playbooks.yaml"))
 processed: set[str] = set()
 decisions: list[dict] = []
 last_recovery_at: dict[tuple[str, str], float] = {}
+retry_counts: dict[tuple[str, str], int] = {}
+failure_streaks: dict[tuple[str, str], int] = {}
+circuit_open_until: dict[tuple[str, str], float] = {}
+playbooks: dict[str, list[dict[str, Any]]] = {}
 
 
 def top_service(
@@ -40,6 +52,8 @@ def top_service(
 
 
 def attributed_target(event: dict) -> str | None:
+    if event.get("target_service"):
+        return str(event["target_service"])
     classification = event.get("classification")
     per_service = event.get("per_service", {})
     if classification == "pod_instability":
@@ -59,21 +73,77 @@ def attributed_target(event: dict) -> str | None:
     return None
 
 
+def default_target_for(classification: str | None) -> str:
+    return {
+        "pod_instability": "order-service",
+        "latency_spike": "order-service",
+        "availability_regression": "payment-service",
+        "application_error_burst": "api-gateway",
+    }.get(classification or "", "api-gateway")
+
+
+def load_playbooks() -> dict[str, list[dict[str, Any]]]:
+    if not PLAYBOOK_PATH.exists():
+        return {}
+    try:
+        payload = yaml.safe_load(PLAYBOOK_PATH.read_text()) or {}
+    except Exception as exc:
+        logger.warning("Playbook load failed", extra={"path": str(PLAYBOOK_PATH), "error": str(exc)})
+        return {}
+    items = payload.get("playbooks", payload)
+    if not isinstance(items, dict):
+        return {}
+    loaded: dict[str, list[dict[str, Any]]] = {}
+    for classification, actions in items.items():
+        if isinstance(actions, list):
+            loaded[str(classification)] = [action for action in actions if isinstance(action, dict)]
+    return loaded
+
+
+def render_playbook_value(value: Any, context: dict[str, Any]) -> Any:
+    if isinstance(value, str):
+        try:
+            return value.format_map(context)
+        except Exception:
+            return value
+    if isinstance(value, list):
+        return [render_playbook_value(item, context) for item in value]
+    if isinstance(value, dict):
+        return {key: render_playbook_value(item, context) for key, item in value.items()}
+    return value
+
+
+def plan_from_playbook(event: dict, target: str | None) -> list[dict]:
+    actions = playbooks.get(str(event.get("classification")))
+    if not actions:
+        return []
+    fallback = default_target_for(event.get("classification"))
+    context = {
+        "target": target or fallback,
+        "classification": event.get("classification", ""),
+        "fallback_target": fallback,
+    }
+    return [render_playbook_value(action, context) for action in actions]
+
+
 def plan_actions(event: dict) -> list[dict]:
     classification = event.get("classification")
     sample = event.get("sample", {})
     target = attributed_target(event)
+    configured = plan_from_playbook(event, target)
+    if configured:
+        return configured
     if classification == "pod_instability":
-        return [{"action": "restart_deployment", "target": target or "order-service"}]
+        return [{"action": "restart_deployment", "target": target or default_target_for(classification)}]
     if classification == "latency_spike":
         return [
-            {"action": "scale_deployment", "target": target or "order-service", "replicas": 3},
-            {"action": "reset_latency", "target": target or "api-gateway"},
+            {"action": "scale_deployment", "target": target or default_target_for(classification), "replicas": 3},
+            {"action": "reset_latency", "target": target or default_target_for(classification)},
         ]
     if classification == "availability_regression":
         return [
-            {"action": "clear_network_partition", "target": target or "payment-service"},
-            {"action": "restart_deployment", "target": target or "payment-service"},
+            {"action": "clear_network_partition", "target": target or default_target_for(classification)},
+            {"action": "restart_deployment", "target": target or default_target_for(classification)},
         ]
     if classification == "application_error_burst" or sample.get("loki_errors", 0) > 4:
         if target == "recommendation-service":
@@ -86,9 +156,9 @@ def plan_actions(event: dict) -> list[dict]:
                 {"action": "restore_cache"},
             ]
         return [
-            {"action": "restart_deployment", "target": target or "api-gateway"},
+            {"action": "restart_deployment", "target": target or default_target_for(classification)},
         ]
-    return [{"action": "restart_deployment", "target": "api-gateway"}]
+    return [{"action": "restart_deployment", "target": default_target_for(classification)}]
 
 
 def is_in_cooldown(classification: str, target: str) -> bool:
@@ -98,11 +168,58 @@ def is_in_cooldown(classification: str, target: str) -> bool:
     return (time.time() - last_seen) < COOLDOWN_SECONDS
 
 
+def circuit_is_open(classification: str, target: str) -> bool:
+    until = circuit_open_until.get((classification, target), 0.0)
+    return until > time.time()
+
+
+def mark_outcome(classification: str, target: str, succeeded: bool) -> None:
+    key = (classification, target)
+    if succeeded:
+        retry_counts[key] = 0
+        failure_streaks[key] = 0
+        circuit_open_until.pop(key, None)
+        return
+    retry_counts[key] = retry_counts.get(key, 0) + 1
+    failure_streaks[key] = failure_streaks.get(key, 0) + 1
+    if failure_streaks[key] >= CIRCUIT_BREAKER_THRESHOLD:
+        circuit_open_until[key] = time.time() + CIRCUIT_BREAKER_SECONDS
+
+
+async def record_suppression(event: dict, planned: list[dict], reason: str, target: str, severity: str = "warning") -> None:
+    decision = {
+        "event": event,
+        "actions": planned,
+        "results": [],
+        "suppressed": True,
+        "reason": reason,
+    }
+    decisions.append(decision)
+    del decisions[:-100]
+    record_history("decision-log", "decision-engine", decision)
+    audit_event(
+        "decision-engine",
+        "decision-suppressed",
+        decision,
+        severity=severity,
+        status=reason,
+        target=target,
+        classification=event.get("classification"),
+    )
+    await notify(
+        "decision-engine",
+        "decision_suppressed",
+        severity,
+        f"Suppressed {event.get('classification')} remediation for {target}: {reason}",
+        decision,
+    )
+
+
 async def control_loop() -> None:
     while True:
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.get(f"{DETECTOR_URL}/events")
+                response = await traced_get(client, f"{DETECTOR_URL}/events")
                 response.raise_for_status()
                 items = response.json()["items"]
         except Exception as exc:
@@ -128,39 +245,107 @@ async def control_loop() -> None:
                             "cooldown_seconds": COOLDOWN_SECONDS,
                         },
                     )
-                    decisions.append(
-                        {
-                            "event": event,
-                            "actions": planned,
-                            "results": [],
-                            "suppressed": True,
-                            "reason": "cooldown",
-                        }
-                    )
-                    del decisions[:-100]
+                    await record_suppression(event, planned, "cooldown", target)
+                    processed.add(event["ts"])
+                    continue
+                if circuit_is_open(event["classification"], target):
+                    logger.warning("Recovery suppressed by circuit breaker", extra={"classification": event["classification"], "target": target})
+                    await record_suppression(event, planned, "circuit_open", target, severity="critical")
+                    processed.add(event["ts"])
+                    continue
+                if retry_counts.get((event["classification"], target), 0) >= MAX_RETRIES_PER_TARGET:
+                    logger.warning("Recovery suppressed by retry limit", extra={"classification": event["classification"], "target": target})
+                    await record_suppression(event, planned, "retry_limit", target, severity="critical")
                     processed.add(event["ts"])
                     continue
                 decision_record = {"event": event, "actions": planned, "results": []}
                 for action in planned:
                     payload = {**action, "reason": event["classification"]}
                     try:
-                        action_response = await client.post(f"{RECOVERY_URL}/recover", json=payload)
+                        action_response = await traced_post(client, f"{RECOVERY_URL}/recover", json=payload)
+                        action_response.raise_for_status()
                         decision_record["results"].append(action_response.json())
                     except Exception as exc:
                         decision_record["results"].append({"status": "failed", "error": str(exc), **payload})
                 decisions.append(decision_record)
                 del decisions[:-100]
-                last_recovery_at[(event["classification"], target)] = time.time()
+                record_history("decision-log", "decision-engine", decision_record)
+                succeeded = all(item.get("status") != "failed" for item in decision_record["results"])
+                mark_outcome(event["classification"], target, succeeded)
+                if succeeded:
+                    last_recovery_at[(event["classification"], target)] = time.time()
                 processed.add(event["ts"])
+                audit_event(
+                    "decision-engine",
+                    "decision-executed",
+                    decision_record,
+                    severity="warning" if succeeded else "critical",
+                    status="completed" if succeeded else "failed",
+                    target=target,
+                    classification=event.get("classification"),
+                )
+                await notify(
+                    "decision-engine",
+                    "decision_executed",
+                    "warning" if succeeded else "critical",
+                    f"{'Executed' if succeeded else 'Failed'} remediation for {event.get('classification')} on {target}",
+                    decision_record,
+                )
                 logger.info("Decision executed", extra={"event": event["classification"], "actions": planned})
         await asyncio.sleep(DECISION_INTERVAL)
 
 
 @app.on_event("startup")
 async def startup() -> None:
+    global playbooks
+    playbooks = load_playbooks()
+    asyncio.create_task(notification_worker())
     asyncio.create_task(control_loop())
 
 
 @app.get("/decisions")
 async def get_decisions() -> dict:
-    return {"items": decisions}
+    return {"items": recent_history("decision-log", 100) or decisions}
+
+
+@app.get("/feedback")
+async def feedback() -> dict:
+    items = recent_history("decision-log", 200) or decisions
+    total = len(items)
+    successful = 0
+    failed = 0
+    suppressed = 0
+    latencies = []
+    by_classification: dict[str, dict[str, Any]] = {}
+    for item in items:
+        event = item.get("event", {})
+        classification = event.get("classification", "unknown")
+        bucket = by_classification.setdefault(classification, {"total": 0, "successful": 0, "failed": 0, "suppressed": 0})
+        bucket["total"] += 1
+        if item.get("suppressed"):
+            suppressed += 1
+            bucket["suppressed"] += 1
+            continue
+        results = item.get("results", [])
+        succeeded = bool(results) and all(result.get("status") != "failed" for result in results)
+        if succeeded:
+            successful += 1
+            bucket["successful"] += 1
+            try:
+                executed_at = last_recovery_at.get((classification, next((action.get("target") or action.get("service_name") for action in item.get("actions", []) if action.get("target") or action.get("service_name")), "unknown")))
+                if executed_at and event.get("ts"):
+                    latencies.append(max(0.0, executed_at - time.mktime(time.strptime(event["ts"][:19], "%Y-%m-%dT%H:%M:%S"))))
+            except Exception:
+                pass
+        else:
+            failed += 1
+            bucket["failed"] += 1
+    return {
+        "total": total,
+        "successful": successful,
+        "failed": failed,
+        "suppressed": suppressed,
+        "success_rate": round(successful / max(total - suppressed, 1), 4),
+        "avg_detection_to_action_seconds": round(sum(latencies) / len(latencies), 3) if latencies else 0.0,
+        "by_classification": by_classification,
+    }

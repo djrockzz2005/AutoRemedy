@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import asyncio
 from datetime import datetime, timezone
 from typing import Any
 
@@ -9,7 +10,10 @@ from fastapi import FastAPI, HTTPException
 from kubernetes import client, config
 from pydantic import BaseModel
 
-from services.shared.observability import install_observability, observe_event
+from services.shared.audit import audit_event
+from services.shared.history import record_history, recent_history
+from services.shared.notifications import notification_worker, notify
+from services.shared.observability import install_observability, observe_event, traced_post
 
 app = FastAPI(title="recovery-engine")
 logger = install_observability(app, "recovery-engine")
@@ -43,6 +47,7 @@ class RecoveryRequest(BaseModel):
 def add_timeline(entry: dict) -> None:
     timeline.append(entry)
     del timeline[:-200]
+    record_history("recovery-timeline", "recovery-engine", entry)
 
 
 def target_namespace(request: RecoveryRequest) -> str:
@@ -103,7 +108,7 @@ async def recover(request: RecoveryRequest) -> dict:
             client.CoreV1Api().patch_namespaced_service(request.service_name, namespace, patch)
         elif request.action == "restore_cache":
             async with httpx.AsyncClient(timeout=4.0) as http_client:
-                response = await http_client.post(f"{INVENTORY_URL}/seed")
+                response = await traced_post(http_client, f"{INVENTORY_URL}/seed")
                 response.raise_for_status()
         elif request.action == "clear_network_partition":
             if not request.target:
@@ -127,10 +132,42 @@ async def recover(request: RecoveryRequest) -> dict:
             raise HTTPException(status_code=400, detail="unknown_action")
         observe_event("recovery-engine", "recovery_executed")
         entry["status"] = "completed"
+        audit_event(
+            "recovery-engine",
+            "recovery-action",
+            entry,
+            severity="warning",
+            status="completed",
+            target=request.target,
+            classification=request.reason,
+        )
+        await notify(
+            "recovery-engine",
+            "recovery_executed",
+            "warning",
+            f"{request.action} executed for {request.target or request.service_name or 'cluster'}",
+            entry,
+        )
     except Exception as exc:
         entry["status"] = "failed"
         entry["error"] = str(exc)
         logger.exception("Recovery failed", extra=entry)
+        audit_event(
+            "recovery-engine",
+            "recovery-action",
+            entry,
+            severity="critical",
+            status="failed",
+            target=request.target,
+            classification=request.reason,
+        )
+        await notify(
+            "recovery-engine",
+            "recovery_failed",
+            "critical",
+            f"{request.action} failed for {request.target or request.service_name or 'cluster'}",
+            entry,
+        )
         add_timeline(entry)
         raise HTTPException(status_code=500, detail=str(exc))
     logger.info("Recovery executed", extra=entry)
@@ -140,7 +177,12 @@ async def recover(request: RecoveryRequest) -> dict:
 
 @app.get("/timeline")
 async def get_timeline() -> dict:
-    return {"items": timeline}
+    return {"items": recent_history("recovery-timeline", 200) or timeline}
+
+
+@app.on_event("startup")
+async def startup() -> None:
+    asyncio.create_task(notification_worker())
 
 
 @app.get("/workloads")

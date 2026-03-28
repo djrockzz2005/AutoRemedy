@@ -1,0 +1,12 @@
+experiments:
+  - name: checkout-latency-drill
+    target: api-gateway
+    interval_seconds: 900
+    observe_seconds: 30
+    steps:
+      - scenario: latency
+        payload:
+          latency_ms: 1200
+      - wait_seconds: 10
+      - scenario: pod-crash
+        payload: {}

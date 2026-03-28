@@ -149,6 +149,85 @@ spec:
 apiVersion: v1
 kind: ConfigMap
 metadata:
+  name: tempo-config
+  namespace: chaos-loop
+data:
+  tempo.yaml: |
+    server:
+      http_listen_port: 3200
+    distributor:
+      receivers:
+        otlp:
+          protocols:
+            http:
+              endpoint: 0.0.0.0:4318
+    ingester:
+      max_block_duration: 5m
+    compactor:
+      compaction:
+        block_retention: 24h
+    storage:
+      trace:
+        backend: local
+        local:
+          path: /tmp/tempo/traces
+        wal:
+          path: /tmp/tempo/wal
+    overrides:
+      defaults:
+        ingestion:
+          burst_size_bytes: 2000000
+          rate_limit_bytes: 1000000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tempo
+  namespace: chaos-loop
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tempo
+  template:
+    metadata:
+      labels:
+        app: tempo
+    spec:
+      containers:
+        - name: tempo
+          image: grafana/tempo:2.7.2
+          args: ["-config.file=/etc/tempo/tempo.yaml"]
+          ports:
+            - containerPort: 3200
+            - containerPort: 4318
+          volumeMounts:
+            - name: config
+              mountPath: /etc/tempo
+      volumes:
+        - name: config
+          configMap:
+            name: tempo-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tempo
+  namespace: chaos-loop
+spec:
+  selector:
+    app: tempo
+  ports:
+    - name: http
+      port: 3200
+      targetPort: 3200
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
   name: grafana-provisioning
   namespace: chaos-loop
 data:
@@ -156,14 +235,26 @@ data:
     apiVersion: 1
     datasources:
       - name: Prometheus
+        uid: Prometheus
         type: prometheus
         access: proxy
         url: http://prometheus:9090
         isDefault: true
       - name: Loki
+        uid: Loki
         type: loki
         access: proxy
         url: http://loki:3100
+      - name: Tempo
+        uid: Tempo
+        type: tempo
+        access: proxy
+        url: http://tempo:3200
+        jsonData:
+          tracesToLogsV2:
+            datasourceUid: Loki
+          nodeGraph:
+            enabled: true
   dashboards.yaml: |
     apiVersion: 1
     providers:
@@ -188,6 +279,34 @@ data:
           "title": "Error Rate",
           "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
           "targets": [{ "expr": "sum(rate(platform_http_requests_total{status=~\"5..\"}[1m]))" }]
+        },
+        {
+          "type": "stat",
+          "title": "Trace Export Endpoint",
+          "gridPos": { "h": 4, "w": 12, "x": 0, "y": 8 },
+          "options": { "textMode": "value" },
+          "targets": [{ "expr": "1" }],
+          "fieldConfig": { "defaults": { "mappings": [{ "type": "value", "options": { "1": { "text": "tempo:4318" } } }] } }
+        },
+        {
+          "type": "timeseries",
+          "title": "SLO Burn Rate",
+          "gridPos": { "h": 4, "w": 12, "x": 12, "y": 8 },
+          "targets": [{ "expr": "sum(rate(platform_http_requests_total{status=~\"5..\"}[5m])) / clamp_min(sum(rate(platform_http_requests_total[5m])), 0.0001)" }]
+        },
+        {
+          "type": "logs",
+          "title": "Trace-Correlated Errors",
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 12 },
+          "datasource": {
+            "type": "loki",
+            "uid": "Loki"
+          },
+          "targets": [
+            {
+              "expr": "{service=~\".+\"} |= \"error\""
+            }
+          ]
         }
       ]
     }
@@ -244,4 +363,3 @@ spec:
     - name: http
       port: 3000
       targetPort: 3000
-

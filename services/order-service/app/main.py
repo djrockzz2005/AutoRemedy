@@ -13,7 +13,8 @@ sys.path.append("/app/generated")
 import inventory_pb2  # type: ignore
 import inventory_pb2_grpc  # type: ignore
 
-from services.shared.observability import install_observability, observe_event
+from services.shared.observability import install_observability, observe_event, traced_get, traced_post
+from services.shared.tracing import grpc_metadata
 from services.shared.store import ensure_table, pg_conn, redis_client, redis_json_set
 
 app = FastAPI(title="order-service")
@@ -51,20 +52,22 @@ class OrderRequest(BaseModel):
 async def create_order(request: OrderRequest) -> dict:
     order_id = str(uuid.uuid4())
     async with httpx.AsyncClient(timeout=4.0) as client:
-        user_response = await client.get(f"{USER_SERVICE}/users/{request.user_id}")
+        user_response = await traced_get(client, f"{USER_SERVICE}/users/{request.user_id}")
         user_response.raise_for_status()
     async with grpc.aio.insecure_channel(INVENTORY_ADDR) as channel:
         stub = inventory_pb2_grpc.InventoryServiceStub(channel)
-        item_state = await stub.GetItem(inventory_pb2.ItemRequest(item_id=request.item_id))
+        item_state = await stub.GetItem(inventory_pb2.ItemRequest(item_id=request.item_id), metadata=grpc_metadata())
         reserve = await stub.ReserveItem(
-            inventory_pb2.ReserveRequest(item_id=request.item_id, quantity=request.quantity)
+            inventory_pb2.ReserveRequest(item_id=request.item_id, quantity=request.quantity),
+            metadata=grpc_metadata(),
         )
     if not reserve.ok:
         raise HTTPException(status_code=409, detail=reserve.message)
 
     amount = item_state.price * request.quantity
     async with httpx.AsyncClient(timeout=4.0) as client:
-        payment_response = await client.post(
+        payment_response = await traced_post(
+            client,
             f"{PAYMENT_SERVICE}/charge",
             json={"user_id": request.user_id, "order_id": order_id, "amount": amount},
         )
@@ -105,4 +108,3 @@ async def get_order(order_id: str) -> dict:
     if not row:
         raise HTTPException(status_code=404, detail="order_not_found")
     return row
-

@@ -14,6 +14,7 @@ import inventory_pb2_grpc  # type: ignore
 
 from services.shared.observability import install_observability, observe_event
 from services.shared.store import redis_client, redis_json_get, redis_json_set
+from services.shared.tracing import extract_grpc_metadata
 
 app = FastAPI(title="inventory-service")
 logger = install_observability(app, "inventory-service")
@@ -38,6 +39,7 @@ def get_item_state(item_id: str) -> dict:
 
 class InventoryApi(inventory_pb2_grpc.InventoryServiceServicer):
     def GetItem(self, request, context):
+        extract_grpc_metadata(context.invocation_metadata())
         state = get_item_state(request.item_id)
         return inventory_pb2.ItemReply(
             item_id=request.item_id,
@@ -46,6 +48,7 @@ class InventoryApi(inventory_pb2_grpc.InventoryServiceServicer):
         )
 
     def ReserveItem(self, request, context):
+        extract_grpc_metadata(context.invocation_metadata())
         state = get_item_state(request.item_id)
         if state["available"] < request.quantity:
             logger.warning("Inventory reserve rejected", extra={"item_id": request.item_id})
@@ -57,6 +60,7 @@ class InventoryApi(inventory_pb2_grpc.InventoryServiceServicer):
         return inventory_pb2.ReserveReply(ok=True, message="reserved", remaining=state["available"])
 
     def RestoreStock(self, request, context):
+        extract_grpc_metadata(context.invocation_metadata())
         state = get_item_state(request.item_id)
         state["available"] += request.quantity
         redis_json_set(cache, f"inventory:{request.item_id}", state)
@@ -89,4 +93,3 @@ async def start_grpc_server() -> None:
         await server.wait_for_termination()
 
     asyncio.create_task(run_server())
-

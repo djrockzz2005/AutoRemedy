@@ -152,6 +152,8 @@ spec:
           env:
             - name: SERVICE_NAME
               value: telemetry-bridge
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://tempo:4318/v1/traces
 ---
 apiVersion: v1
 kind: Service
@@ -188,6 +190,8 @@ spec:
           env:
             - name: SERVICE_NAME
               value: anomaly-detector
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://tempo:4318/v1/traces
 ---
 apiVersion: v1
 kind: Service
@@ -225,6 +229,8 @@ spec:
           env:
             - name: SERVICE_NAME
               value: recovery-engine
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://tempo:4318/v1/traces
 ---
 apiVersion: v1
 kind: Service
@@ -261,6 +267,8 @@ spec:
           env:
             - name: SERVICE_NAME
               value: decision-engine
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://tempo:4318/v1/traces
 ---
 apiVersion: v1
 kind: Service
@@ -298,6 +306,8 @@ spec:
           env:
             - name: SERVICE_NAME
               value: chaos-engine
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://tempo:4318/v1/traces
 ---
 apiVersion: v1
 kind: Service
@@ -335,6 +345,17 @@ spec:
           env:
             - name: SERVICE_NAME
               value: dashboard
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://tempo:4318/v1/traces
+          volumeMounts:
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+              readOnly: true
+      volumes:
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+            type: Socket
 ---
 apiVersion: v1
 kind: Service

@@ -20,6 +20,8 @@ spec:
           env:
             - name: SERVICE_NAME
               value: user-service
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://tempo:4318/v1/traces
 ---
 apiVersion: v1
 kind: Service
@@ -56,6 +58,8 @@ spec:
           env:
             - name: SERVICE_NAME
               value: payment-service
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://tempo:4318/v1/traces
 ---
 apiVersion: v1
 kind: Service
@@ -92,6 +96,8 @@ spec:
           env:
             - name: SERVICE_NAME
               value: inventory-service
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://tempo:4318/v1/traces
             - name: GRPC_PORT
               value: "50051"
           ports:
@@ -136,6 +142,8 @@ spec:
           env:
             - name: SERVICE_NAME
               value: order-service
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://tempo:4318/v1/traces
 ---
 apiVersion: v1
 kind: Service
@@ -194,6 +202,8 @@ spec:
           env:
             - name: SERVICE_NAME
               value: recommendation-service
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://tempo:4318/v1/traces
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -219,6 +229,8 @@ spec:
           env:
             - name: SERVICE_NAME
               value: recommendation-service-shadow
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://tempo:4318/v1/traces
 ---
 apiVersion: v1
 kind: Service
@@ -270,6 +282,8 @@ spec:
           env:
             - name: SERVICE_NAME
               value: api-gateway
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://tempo:4318/v1/traces
 ---
 apiVersion: v1
 kind: Service
@@ -283,4 +297,3 @@ spec:
     - name: http
       port: 8000
       targetPort: 8000
-

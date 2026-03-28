@@ -4,11 +4,14 @@ import asyncio
 import os
 from collections import deque
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import httpx
 from fastapi import FastAPI
+import yaml
 
+from services.shared.history import record_history, recent_history
 from services.shared.observability import install_observability
 
 app = FastAPI(title="telemetry-bridge")
@@ -20,6 +23,7 @@ WINDOW = int(os.getenv("FEATURE_WINDOW", "120"))
 COLLECT_INTERVAL = float(os.getenv("COLLECT_INTERVAL_SECONDS", "2"))
 history: deque[dict] = deque(maxlen=WINDOW)
 latest_per_service: dict[str, dict[str, float]] = {}
+SLO_PATH = Path(os.getenv("SLO_PATH", "/app/config/slos.yaml"))
 
 QUERIES = {
     "request_rate": 'sum(rate(platform_http_requests_total{status!~"5.."}[1m]))',
@@ -109,6 +113,63 @@ def merge_per_service(samples: dict[str, dict[str, float]], services: set[str]) 
     return merged
 
 
+def load_slos() -> dict[str, dict[str, float]]:
+    if not SLO_PATH.exists():
+        return {}
+    try:
+        payload = yaml.safe_load(SLO_PATH.read_text()) or {}
+    except Exception as exc:
+        logger.warning("Failed to load SLO config", extra={"path": str(SLO_PATH), "error": str(exc)})
+        return {}
+    services = payload.get("services", payload)
+    return services if isinstance(services, dict) else {}
+
+
+def evaluate_slos(metrics: dict[str, dict[str, float]], slos: dict[str, dict[str, float]]) -> dict[str, Any]:
+    items = []
+    for service, targets in slos.items():
+        observed = metrics.get(service, {})
+        latency_target = float(targets.get("latency_p95_max", 0.5))
+        error_target = float(targets.get("error_rate_max", 0.05))
+        availability_target = float(targets.get("availability_min", 0.99))
+        latency_ok = observed.get("latency_p95", 0.0) <= latency_target
+        error_ok = observed.get("error_rate", 0.0) <= error_target
+        availability_ok = observed.get("availability", 1.0) >= availability_target
+        checks = [
+            ("latency_p95", latency_ok),
+            ("error_rate", error_ok),
+            ("availability", availability_ok),
+        ]
+        passed = sum(1 for _, ok in checks if ok)
+        compliance = round((passed / len(checks)) * 100.0, 2)
+        violations = [name for name, ok in checks if not ok]
+        burn_rate = round(
+            max(
+                observed.get("latency_p95", 0.0) / max(latency_target, 0.0001),
+                observed.get("error_rate", 0.0) / max(error_target, 0.0001),
+                availability_target / max(observed.get("availability", 0.0001), 0.0001),
+            ),
+            3,
+        )
+        items.append(
+            {
+                "service": service,
+                "compliance": compliance,
+                "healthy": not violations,
+                "violations": violations,
+                "burn_rate": burn_rate,
+                "targets": {
+                    "latency_p95_max": latency_target,
+                    "error_rate_max": error_target,
+                    "availability_min": availability_target,
+                },
+                "observed": observed,
+            }
+        )
+    overall = round(sum(item["compliance"] for item in items) / len(items), 2) if items else 100.0
+    return {"ts": datetime.now(timezone.utc).isoformat(), "overall_compliance": overall, "items": items}
+
+
 async def collect_features() -> None:
     global latest_per_service
     while True:
@@ -138,6 +199,7 @@ async def collect_features() -> None:
             sample.setdefault("availability", 1.0)
             sample["per_service"] = latest_per_service
         history.append(sample)
+        record_history("telemetry-history", "telemetry-bridge", sample)
         await asyncio.sleep(COLLECT_INTERVAL)
 
 
@@ -153,7 +215,7 @@ async def latest() -> dict:
 
 @app.get("/features/history")
 async def all_features() -> dict:
-    return {"items": list(history)}
+    return {"items": recent_history("telemetry-history", WINDOW) or list(history)}
 
 
 @app.get("/features/per-service")
@@ -163,3 +225,8 @@ async def per_service() -> dict[str, Any]:
         "ts": latest.get("ts"),
         "items": latest_per_service,
     }
+
+
+@app.get("/slo/status")
+async def slo_status() -> dict[str, Any]:
+    return evaluate_slos(latest_per_service, load_slos())
